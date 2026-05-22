@@ -1,0 +1,17 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment directories
+env/
+venv/
+.venv/
+
+# Local env files
+RAG Pipeline/.env
+
+# Editor temporary files
+*.swp
+*.swo
+.DS_Store
