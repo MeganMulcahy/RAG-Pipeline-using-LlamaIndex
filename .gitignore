@@ -9,7 +9,7 @@ venv/
 .venv/
 
 # Local env files
-RAG Pipeline/.env
+.env
 
 # Editor temporary files
 *.swp
