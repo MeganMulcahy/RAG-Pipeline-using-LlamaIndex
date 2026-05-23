@@ -1,73 +1,58 @@
 import os
 import fitz  # PyMuPDF
-import nest_asyncio
+from dotenv import load_dotenv
 from llama_index.core import Document
 from typing import List
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.core import Settings
 from llama_index.core import VectorStoreIndex
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
-from rag_models import initialize_models
 
-# Module-level object placeholders. Actual initialization happens inside runtime setup.
-llm = None
-embed_model = None
+load_dotenv()
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not set. Add it to your .env file.")
 
-def initialize_runtime():
-    global llm, embed_model
-    nest_asyncio.apply()
-    llm, embed_model = initialize_models()
+MODEL_NAME = os.getenv("GOOGLE_MODEL")
 
+# Initialize Gemini LLM with max_output_tokens to control response length and token usage
+llm = GoogleGenAI(
+    model=MODEL_NAME,
+    max_tokens=500,
+    system_prompt="""
+    You are a strict extraction engine.
 
-# File upload
-def file_upload():
-    # If running in notebook-like environments with files.upload available,
-    # use it. Otherwise, ask for a local PDF path.
-    if 'files' in globals() and hasattr(files, 'upload'):
-        print("Please select a PDF file to upload:")
-        uploaded = files.upload()
+    Rules:
+    - Output exactly ONE sentence.
+    - Maximum 15 words.
+    - No explanations.
+    - No markdown.
+    - No bullet points.
+    - No introductions or conclusions.
+    - No extra context.
+    - Answer directly using retrieved information only.
+    """
+)
+Settings.llm = llm
 
-        for filename, filedata in uploaded.items():
-            if filename.lower().endswith('.pdf'):
-                with open(filename, 'wb') as f:
-                    f.write(filedata)
-                return filename
-            else:
-                print(f"File {filename} is not a PDF. Please upload a PDF file.")
+# Initialize embedding model
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL_NAME)
+Settings.embed_model = embed_model
 
-        raise ValueError("No PDF file was uploaded.")
-
-    while True:
-        pdf_path = input("Enter the local path to a PDF file: ").strip()
-        if not pdf_path:
-            print("PDF path is required. Please try again.")
-            continue
-        if not os.path.isfile(pdf_path):
-            print(f"PDF file not found: {pdf_path}")
-            continue
-        if not pdf_path.lower().endswith('.pdf'):
-            print("The specified file is not a PDF. Please enter a .pdf file.")
-            continue
-        return pdf_path
-
-
-# Extract text
-def extract_text_pdf(pdf_name):
-    doc = fitz.open(pdf_name)
-
-    # Extract text from all pages
-    text = "\n".join([page.get_text() for page in doc])
-
-    # Print some stats
-    print(f"Number of pages: {len(doc)}")
-    print(f"Extracted {len(text.split())} words from the PDF.")
-
-    doc.close()
-    print(text[:500])  # Print first 500
-    return
+def get_pdf_path() -> str:
+    pdf_path = input("Enter the path to your PDF file: ").strip()
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"File not found: {pdf_path}")
+    if not pdf_path.lower().endswith(".pdf"):
+        raise ValueError(f"Not a PDF file: {pdf_path}")
+    return pdf_path
 
 # Convert pdf to LlammaIndex file
 def load_pdf_with_pymupdf(pdf_path: str) -> List[Document]:
@@ -226,26 +211,21 @@ def build_rag_pipeline(index):
 
     return query_engine
 
+# Example usage:
+pdf_path = get_pdf_path()
+index = process_and_index_pdf(pdf_path)
 
-def main():
-    initialize_runtime()
-    pdf_path = file_upload()
-    index = process_and_index_pdf(pdf_path)
+# The system prompt is now defined within build_rag_pipeline, no need to pass it here
+rag_engine = build_rag_pipeline(index)
 
-    # The system prompt is now defined within initialize_models(), no need to pass it here
-    rag_engine = build_rag_pipeline(index)
+print('\nChat with the RAG engine. Type exit to quit.\n')
 
-    print('\nChat with the RAG engine. Type exit to quit.\n')
-    while True:
-        user_query = input("Enter your query: ")
-        if user_query.lower() == 'exit':
-            print("Exiting chat. Goodbye!")
-            break
+while True:
+    user_query = input("Enter your query: ")
+    if user_query.lower() == 'exit':
+        print("Exiting chat. Goodbye!")
+        break
 
-        response = rag_engine.query(user_query)
-        print(response)
-        print('\n---------------------- \n')
-
-
-if __name__ == "__main__":
-    main()
+    response = rag_engine.query(user_query)
+    print(response)
+    print('\n---------------------- \n')
