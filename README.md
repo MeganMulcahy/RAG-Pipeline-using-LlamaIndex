@@ -10,7 +10,7 @@ Upload a mortgage PDF and ask plain-English questions. The system extracts text,
 
 | Component | Tool |
 |---|---|
-| **LLM** | Google Gemini (via `llama-index-llms-google-genai`) |
+| **LLM** | Google Gemini (via `llama-index-llms-google-genai`)|
 | **Embeddings** | HuggingFace `sentence-transformers/all-MiniLM-L6-v2` |
 | **RAG Framework** | LlamaIndex |
 | **PDF Extraction** | PyMuPDF (`fitz`) |

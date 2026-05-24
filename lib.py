@@ -6,8 +6,11 @@ REQUIRED_PACKAGES = [
     "llama-index-llms-google-genai",
     "llama-index-embeddings-huggingface",
     "llama-index-retrievers-bm25",
+    "llama-index-llms-llama-cpp",
+    "llama-index-llms-ollama",
     "pymupdf",
-    "nest_asyncio",
+    "llama-index-readers-file",
+    "gradio",
 ]
 
 
