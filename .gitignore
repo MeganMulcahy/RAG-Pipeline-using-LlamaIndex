@@ -24,6 +24,12 @@ storage/
 .cache/
 *.faiss
 
+# Large model files
+*.gguf
+*.bin
+*.safetensors
+content/
+
 # OS
 .DS_Store
 Thumbs.db

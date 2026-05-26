@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:\\\\content\" 2>/dev/null || ls \"C:\\\\Users\\\\megan\\\\Desktop\\\\RAG-Pipeline-using-LlamaIndex\\\\content\" 2>/dev/null || echo \"not found in either location\")",
+      "Read(//c//**)",
+      "Bash(ls /mnt/c/Users/megan/.claude/projects/ 2>/dev/null | head -20)",
+      "Read(//mnt/c/Users/megan/.claude/**)",
+      "Bash(sed -i 's/SentenceSplitter\\(chunk_size=512, chunk_overlap=50\\)/SentenceSplitter\\(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP\\)/' /mnt/c/Users/megan/Desktop/RAG-Pipeline-using-LlamaIndex/rag_pie.py)",
+      "Bash(sed -i 's/safe_top_k = min\\(2, max\\(1, num_nodes\\)\\)/safe_top_k = min\\(TOP_K, max\\(1, num_nodes\\)\\)/' /mnt/c/Users/megan/Desktop/RAG-Pipeline-using-LlamaIndex/rag_pie.py)",
+      "Bash(sed -i 's/top_n=min\\(2, num_nodes\\)/top_n=min\\(TOP_K, num_nodes\\)/' /mnt/c/Users/megan/Desktop/RAG-Pipeline-using-LlamaIndex/rag_pie.py)",
+      "Bash(python -c \"import gradio; print\\(gradio.__version__\\)\")",
+      "Bash(python -c \"import gradio; print\\(gradio.__version__, gradio.__file__\\)\")",
+      "Bash(python -c \"import gradio_pdf\")"
+    ]
+  }
+}
