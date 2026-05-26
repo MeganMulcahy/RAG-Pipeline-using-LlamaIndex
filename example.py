@@ -19,7 +19,6 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.vector_stores import MetadataFilters, MetadataFilter, FilterOperator
 
 # Configure Gemini (replace with your API key)
-GEMINI_API_KEY = "AIzaSyA8IjR2fmLYMEOSj60nNxpTgL9o_Pqgmug"
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("models/gemini-3.1-flash-lite")
 

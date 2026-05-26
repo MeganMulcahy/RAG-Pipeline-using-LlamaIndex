@@ -30,13 +30,14 @@ for _noisy in ("httpx", "huggingface_hub", "huggingface_hub.file_download", "sen
 
 # --- CONFIG -------------------------------------------------------------------
 
-MODEL_PATH      = "content/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
-TEMPERATURE     = 0.0
-MAX_NEW_TOKENS  = 512
-CONTEXT_WINDOW  = 2048
-GPU_LAYERS      = 20
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE      = 512
+MODEL_PATH           = "content/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+TEMPERATURE          = 0.0
+MAX_NEW_TOKENS       = 512   # used for query answers
+CLASSIFY_MAX_TOKENS  = 8    # classification needs ≤5 tokens — keep it tiny
+CONTEXT_WINDOW       = 2048
+GPU_LAYERS           = 35   # raise this as high as your VRAM allows (full offload = 32 for Q4)
+EMBEDDING_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE           = 512
 CHUNK_OVERLAP   = 100
 TOP_K           = 3
 
@@ -215,9 +216,68 @@ _DOC_TYPES = [
     "Insurance", "Report", "Letter", "Form", "ID Document", "Medical", "Other",
 ]
 
+# Keyword pre-filter — requires 2+ hits to fire so single-word overlaps don't mislead.
+# Order matters: more-specific types listed first.
+_KEYWORD_RULES: List[tuple] = [
+    ("Lender Fee Sheet", ["loan estimate", "closing disclosure", "good faith estimate",
+                          "origination charges", "origination fee", "lender credits",
+                          "discount points", "title service", "underwriting fee",
+                          "appraisal fee", "recording fee"]),
+    ("Pay Slip",         ["pay stub", "pay slip", "gross pay", "net pay",
+                          "year to date", "ytd", "payroll", "deductions",
+                          "earnings statement", "pay period"]),
+    ("Bank Statement",   ["account balance", "statement period", "beginning balance",
+                          "ending balance", "deposits", "withdrawals", "transaction history"]),
+    ("Tax Document",     ["w-2", "form w2", "1099", "tax return", "taxable income",
+                          "tax withheld", "irs", "adjusted gross income"]),
+    ("Invoice",          ["invoice #", "invoice no", "invoice number", "amount due",
+                          "bill to", "payment due", "purchase order", "subtotal"]),
+    ("Mortgage Contract",["promissory note", "deed of trust", "mortgage loan",
+                          "loan amount", "interest rate", "monthly payment", "escrow"]),
+    ("Land Deed",        ["grantor", "grantee", "parcel", "legal description",
+                          "convey", "deed of conveyance", "assessor parcel"]),
+    ("Resume",           ["work experience", "education", "references", "curriculum vitae",
+                          "professional summary", "skills", "employment history"]),
+    ("Insurance",        ["policy number", "premium", "coverage", "insured",
+                          "deductible", "beneficiary", "insurance policy"]),
+    ("ID Document",      ["driver's license", "passport", "date of birth",
+                          "license number", "identification number", "expiration date"]),
+    ("Medical",          ["diagnosis", "prescription", "patient", "physician",
+                          "medical record", "treatment", "dosage"]),
+]
+
+def _keyword_classify(text: str) -> Optional[str]:
+    """Fast O(n) keyword scan. Returns a type if 2+ keywords match, else None."""
+    lower = text[:800].lower()
+    for doc_type, keywords in _KEYWORD_RULES:
+        if sum(1 for kw in keywords if kw in lower) >= 2:
+            return doc_type
+    return None
+
+def _heuristic_same_doc(prev_text: str, curr_text: str) -> Optional[bool]:
+    """
+    Returns True/False when the answer is obvious without an LLM call, else None.
+    - Very short page → almost always a continuation (cover/separator/blank)
+    - Page number > 1 in header → continuation
+    """
+    if len(curr_text.strip()) < 120:
+        return True
+    # Look for explicit page markers like "Page 2" or "2 of 10"
+    import re as _re
+    m = _re.search(r'\bpage\s+([2-9]\d*|\d{2,})\b|\b([2-9]\d*|\d{2,})\s+of\s+\d+\b',
+                   curr_text[:300].lower())
+    if m:
+        return True
+    return None
+
 def classify_doc_type(text: str) -> str:
+    # Fast path — keyword scan avoids LLM entirely when confident
+    quick = _keyword_classify(text)
+    if quick:
+        return quick
+
     _llm_rate_limiter.check()
-    text_sample = sanitize_text(text, max_chars=1500)
+    text_sample = sanitize_text(text, max_chars=500)  # 500 chars is enough; less = faster
 
     prompt = (
         "You are a document classifier. Output exactly one category name — nothing else.\n\n"
