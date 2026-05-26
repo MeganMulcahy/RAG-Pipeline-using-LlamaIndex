@@ -1,15 +1,17 @@
 import os
+import re
+import time
 import uuid
 import logging
+from collections import deque
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Optional, Dict
+from dataclasses import dataclass
 
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+import contextlib
+import sys
 
-from llama_index.readers.file import PDFReader
-
+import fitz  # PyMuPDF
 from llama_index.core import Document, VectorStoreIndex, Settings
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import BaseRetriever
@@ -22,17 +24,98 @@ from llama_index.core.node_parser import SentenceSplitter
 
 load_dotenv()
 
+# Silence noisy third-party loggers (httpx HuggingFace requests, sentence-transformers)
+for _noisy in ("httpx", "huggingface_hub", "huggingface_hub.file_download", "sentence_transformers"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # --- CONFIG -------------------------------------------------------------------
 
 MODEL_PATH      = "content/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
-TEMPERATURE     = 0.7
+TEMPERATURE     = 0.0
 MAX_NEW_TOKENS  = 512
 CONTEXT_WINDOW  = 2048
-GPU_LAYERS      = 3
+GPU_LAYERS      = 20
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE      = 512
 CHUNK_OVERLAP   = 100
 TOP_K           = 3
+
+# --- Security -----------------------------------------------------------------
+
+MAX_PDF_SIZE_MB   = 50
+MAX_PDF_PAGES     = 300
+MAX_QUERY_LENGTH  = 500
+LLM_CALLS_PER_MIN = 30   # max LLM invocations per 60-second window
+
+class RateLimiter:
+    def __init__(self, max_calls: int, window_seconds: int = 60):
+        self._max_calls = max_calls
+        self._window = window_seconds
+        self._timestamps: deque = deque()
+
+    def check(self):
+        now = time.monotonic()
+        cutoff = now - self._window
+        while self._timestamps and self._timestamps[0] < cutoff:
+            self._timestamps.popleft()
+        if len(self._timestamps) >= self._max_calls:
+            raise RuntimeError(
+                f"Rate limit exceeded: max {self._max_calls} LLM calls per "
+                f"{self._window}s. Please wait before retrying."
+            )
+        self._timestamps.append(now)
+
+_llm_rate_limiter = RateLimiter(max_calls=LLM_CALLS_PER_MIN)
+
+_INJECTION_PATTERNS = re.compile(
+    r"(ignore\s+(all\s+)?previous\s+instructions?|"
+    r"disregard\s+(all\s+)?prior\s+(instructions?|context)|"
+    r"you\s+are\s+now\s+a|"
+    r"new\s+instructions?:|"
+    r"system\s*:\s*you|"
+    r"<\s*/?(?:system|user|assistant|prompt|instruction)\s*>)",
+    re.IGNORECASE,
+)
+
+def sanitize_text(text: str, max_chars: int = 2000) -> str:
+    """Strip prompt-injection patterns and control characters from text."""
+    # remove null bytes and non-printable control chars (keep newlines/tabs)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = _INJECTION_PATTERNS.sub("[REMOVED]", text)
+    return text[:max_chars]
+
+def validate_pdf_path(pdf_path: str) -> None:
+    real = os.path.realpath(pdf_path)
+    if not os.path.isfile(real):
+        raise ValueError(f"File not found: {pdf_path}")
+    if not real.lower().endswith(".pdf"):
+        raise ValueError(f"Not a PDF file: {pdf_path}")
+    size_mb = os.path.getsize(real) / (1024 * 1024)
+    if size_mb > MAX_PDF_SIZE_MB:
+        raise ValueError(f"PDF too large ({size_mb:.1f} MB). Limit: {MAX_PDF_SIZE_MB} MB")
+
+def validate_query(query: str) -> str:
+    if not query or not query.strip():
+        raise ValueError("Query cannot be empty.")
+    if len(query) > MAX_QUERY_LENGTH:
+        raise ValueError(f"Query too long ({len(query)} chars). Limit: {MAX_QUERY_LENGTH}.")
+    return sanitize_text(query, max_chars=MAX_QUERY_LENGTH)
+
+@contextlib.contextmanager
+def _quiet_llm():
+    """Redirect C-level stdout so llama.cpp raw tokens don't bleed into the terminal."""
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        saved = os.dup(sys.stdout.fileno())
+        os.dup2(null_fd, sys.stdout.fileno())
+        try:
+            yield
+        finally:
+            os.dup2(saved, sys.stdout.fileno())
+            os.close(null_fd)
+            os.close(saved)
+    except Exception:
+        yield  # fallback: if fd tricks fail, just proceed normally
 
 # --- Model Setup --------------------------------------------------------------
 
@@ -52,120 +135,178 @@ embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
 Settings.llm = llm
 Settings.embed_model = embed_model
 
+# Kill llama.cpp's C-level log callback so nothing leaks to the terminal
+try:
+    import llama_cpp as _llama_cpp
+    _llama_cpp.llama_log_set(lambda *_: None, None)
+except Exception:
+    pass
+
 # Populated by load_pdf — used for metadata-based routing
 pdf_metadata_store = []
 
+@dataclass
+class PageInfo:
+    """Stores information about a single page"""
+    page_num: int
+    text: str
+    doc_type: Optional[str] = None
+    page_in_doc: int = 0
 
-# --- 1. PDF Input -------------------------------------------------------------
+@dataclass
+class LogicalDocument:
+    """A contiguous group of pages identified as one document"""
+    doc_id: str
+    doc_type: str
+    page_start: int
+    page_end: int
+    text: str
+    chunks: List[Dict] = None
 
+# Document Ingestion & Extraction
+# 1. PDF Input
 def get_pdf_path() -> str:
     while True:
         pdf_path = input("Enter the path to your PDF file: ").strip()
-        if not os.path.isfile(pdf_path):
-            print(f"File not found: {pdf_path}. Please try again.")
-        elif not pdf_path.lower().endswith(".pdf"):
-            print(f"Not a PDF file: {pdf_path}. Please try again.")
-        else:
+        try:
+            validate_pdf_path(pdf_path)
             return pdf_path
+        except ValueError as e:
+            print(f"{e}. Please try again.")
+# 2. PDF Loading
+def blob_reader(pdf_path: str) -> List[PageInfo]:
+    if isinstance(pdf_path, dict) and "content" in pdf_path:
+        doc = fitz.open(stream=pdf_path["content"], filetype="pdf")
+    elif hasattr(pdf_path, "read"):
+        doc = fitz.open(stream=pdf_path.read(), filetype="pdf")
+    else:
+        doc = fitz.open(pdf_path)
+    
+    if len(doc) > MAX_PDF_PAGES:
+        doc.close()
+        raise ValueError(f"PDF has {len(doc)} pages. Limit: {MAX_PDF_PAGES}.")
 
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text()
+        if not text.strip():
+            print(f"No text available, performing OCR")
+            try:
+                pix = page.get_pixmap()
+                img_data = pix.tobytes("png")
+                from PIL import Image
+                import pytesseract
+                import io
 
-# --- 2. PDF Loading -----------------------------------------------------------
+                img = Image.open(io.BytesIO(img_data))
+                text = pytesseract.image_to_string(img)
+                print(f"  Page {i}: OCR extracted {len(text)} characters")
+            except Exception as e:
+                print(f"  Page {i}: OCR failed - {e}")
+                text = ""
+        pages.append(PageInfo(page_num=i, text=text))
 
-def blob_reader(pdf_path: str) -> list:
-    loader = PDFReader()
-    raw_pages = loader.load_data(pdf_path)
-    return [{"page_num": i + 1, "text": doc.text} for i, doc in enumerate(raw_pages)]
+    doc.close()
+    return pages
 
-
-_DOC_TYPES = ["Resume", "Contract", "Fees Worksheet", "ID", "PaySlip", "W2", "Other"]
-
-# Keyword rules applied directly to page text — much more reliable than parsing LLM output
-_DOC_TYPE_RULES = {
-    "ID":             ["driver's license", "driver license", "passport",
-                       "date of birth", "photo id", "identification card"],
-    "W2":             ["w-2", "wage and tax statement", "wages, tips", "form w2"],
-    "Fees Worksheet": ["fees worksheet", "fee worksheet", "lender fee", "closing cost",
-                       "cost sheet", "estimated settlement", "loan estimate", "closing disclosure"],
-    "PaySlip":        ["pay stub", "payslip", "pay slip", "earnings statement",
-                       "gross pay", "net pay", "year-to-date", "ytd earnings"],
-    "Contract":       ["contract", "hereby agrees", "terms and conditions",
-                       "entered into", "this agreement"],
-    "Resume":         ["curriculum vitae", "career summary", "work experience",
-                       "employment history", "objective statement"],
-}
-
-
-def _rule_based_classify(text: str) -> str:
-    """Keyword-only check on first 400 chars. Returns 'Other' if no match."""
-    header = text[:400].lower()
-    for doc_type, keywords in _DOC_TYPE_RULES.items():
-        if any(kw in header for kw in keywords):
-            return doc_type
-    return "Other"
-
-
-def is_same_document(prev_text: str, curr_text: str, doc_type: str = None) -> bool:
-    curr_type = _rule_based_classify(curr_text)
-
-    # Page header clearly matches a different known type → new document
-    if curr_type != "Other" and curr_type != doc_type:
-        return False
-
-    # No keywords in header → body/continuation text, treat as same document
-    if curr_type == "Other":
-        return True
-
-    # Header matches the same type — use LLM only to distinguish two separate
-    # docs of the same type (e.g. two back-to-back contracts) from a true continuation
-    prompt = (
-        f"Both pages are '{doc_type}' documents.\n\n"
-        f"End of previous page:\n{prev_text[-300:]}\n\n"
-        f"Beginning of next page:\n{curr_text[:300]}\n\n"
-        "Is the next page a continuation of the SAME document, or the start of a NEW separate document?\n"
-        "Answer ONLY Yes (same document) or No (new document)."
-    )
-    response = str(llm.complete(prompt)).strip().lower()
-    return response.startswith("yes")
-
+_DOC_TYPES = [
+    "Resume", "Contract", "Mortgage Contract", "Invoice", "Pay Slip",
+    "Lender Fee Sheet", "Land Deed", "Bank Statement", "Tax Document",
+    "Insurance", "Report", "Letter", "Form", "ID Document", "Medical", "Other",
+]
 
 def classify_doc_type(text: str) -> str:
-    lower = text.lower()
-    for doc_type, keywords in _DOC_TYPE_RULES.items():
-        if any(kw in lower for kw in keywords):
-            return doc_type
-    return _llm_classify(text)
+    _llm_rate_limiter.check()
+    text_sample = sanitize_text(text, max_chars=1500)
 
-
-def _llm_classify(text: str) -> str:
     prompt = (
-        "What type of document does this text belong to?\n"
-        "Reply with ONE of these exact types only:\n"
-        "Resume | Contract | Fees Worksheet | ID | PaySlip | W2 | Other\n\n"
-        f"Text:\n{text[:400]}\n\nType:"
+        "You are a document classifier. Output exactly one category name — nothing else.\n\n"
+        "Categories:\n"
+        "Resume, Contract, Mortgage Contract, Invoice, Pay Slip, Lender Fee Sheet, "
+        "Land Deed, Bank Statement, Tax Document, Insurance, Report, Letter, Form, "
+        "ID Document, Medical, Other\n\n"
+        "IMPORTANT DISTINCTIONS:\n"
+        "- Lender Fee Sheet = a FEE SCHEDULE listing loan costs (origination fee, appraisal, "
+        "  title insurance, discount points, APR, closing costs). It is NOT a contract. "
+        "  Look for: 'Loan Estimate', 'Closing Disclosure', 'Good Faith Estimate', "
+        "  'origination charges', 'APR', 'discount points', 'lender credits', 'title service fees'.\n"
+        "- Contract = a legal agreement with parties, obligations, clauses. "
+        "  Look for: 'AGREEMENT', 'WHEREAS', 'IN WITNESS WHEREOF', 'the parties agree', "
+        "  'terms and conditions', 'obligations'.\n"
+        "- Mortgage Contract = a HOME LOAN agreement (not a fee sheet). "
+        "  Look for: 'mortgage', 'promissory note', 'deed of trust', 'borrower', 'principal'.\n\n"
+        "Examples:\n"
+        'Sample: "EMPLOYMENT AGREEMENT entered into between..." -> Contract\n'
+        'Sample: "ANNEXURE A forms part of the Agreement dated..." -> Contract\n'
+        'Sample: "LEASE AGREEMENT between Landlord and Tenant..." -> Contract\n'
+        'Sample: "NON-DISCLOSURE AGREEMENT parties agree to keep confidential..." -> Contract\n'
+        'Sample: "Loan Estimate  Origination Charges $1,500  Appraisal Fee $450  APR 6.75%..." -> Lender Fee Sheet\n'
+        'Sample: "Closing Disclosure  Total Loan Costs  Discount Points 0.5%  Lender Credits..." -> Lender Fee Sheet\n'
+        'Sample: "Good Faith Estimate  Loan origination fee 1%  Credit report $35  Title insurance $800..." -> Lender Fee Sheet\n'
+        'Sample: "Lender Fee Worksheet  Processing fee $500  Underwriting $895  Recording fee $125..." -> Lender Fee Sheet\n'
+        'Sample: "PAY STUB  Employee: John Smith  Gross Pay: $3,200  Net Pay: $2,450..." -> Pay Slip\n'
+        'Sample: "MORTGAGE AGREEMENT  This Home Loan is made between Borrower and Lender..." -> Mortgage Contract\n\n'
+        f"Document sample:\n{text_sample}\n\n"
+        "Category:"
     )
-    raw = str(llm.complete(prompt)).strip().split("\n")[0]
-    for known in _DOC_TYPES:
-        if known.lower() in raw.lower():
+    with _quiet_llm():
+        response = str(llm.complete(prompt)).strip().split('\n')[0]
+    # Longest names first so "Mortgage Contract" is checked before "Contract"
+    for known in sorted(_DOC_TYPES, key=len, reverse=True):
+        if known.lower() in response.lower():
             return known
     return "Other"
 
+def is_same_document(prev_text: str, curr_text: str, doc_type: str = None) -> bool:
+    if not prev_text or not curr_text:
+        return False
 
-def group_logical_docs(metadata_store: list, source_file: str) -> list:
+    _llm_rate_limiter.check()
+    prev_sample = sanitize_text(prev_text[-500:] if len(prev_text) > 500 else prev_text, max_chars=500)
+    curr_sample = sanitize_text(curr_text[:500] if len(curr_text) > 500 else curr_text, max_chars=500)
+
+    prompt = (
+        "You are a document boundary detector. "
+        f"The current document type is: {doc_type or 'Unknown'}.\n\n"
+        f"End of previous page:\n...{prev_sample}\n\n"
+        f"Start of current page:\n{curr_sample}...\n\n"
+        "Do these two pages belong to the same document? "
+        "Reply with a single word — Yes or No — and nothing else."
+    )
+    with _quiet_llm():
+        response = str(llm.complete(prompt)).strip()
+    return response.lower().startswith('yes')
+
+def group_logical_docs(metadata_store: list) -> List[LogicalDocument]:
     logical_docs = []
-    current_doc = {"text": "", "doc_type": None, "page_start": 0, "source_file": source_file}
+    doc_counter = 0
+    current_pages = []
+    current_doc_type = None
 
     for page in metadata_store:
-        if page["page_in_doc"] == 0 and current_doc["text"]:
-            current_doc["page_end"] = page["page"] - 1
-            logical_docs.append(current_doc)
-            current_doc = {"text": "", "doc_type": None, "page_start": page["page"], "source_file": source_file}
+        if page["page_in_doc"] == 0 and current_pages:
+            logical_docs.append(LogicalDocument(
+                doc_id=f"doc_{doc_counter}",
+                doc_type=current_doc_type,
+                page_start=current_pages[0]["page"],
+                page_end=current_pages[-1]["page"],
+                text="\n\n".join(p["text"] for p in current_pages),
+            ))
+            doc_counter += 1
+            current_pages = []
 
-        current_doc["text"] += "\n\n" + page["text"]
-        current_doc["doc_type"] = page["doc_type"]
+        current_pages.append(page)
+        current_doc_type = page["doc_type"]
 
-    if metadata_store:
-        current_doc["page_end"] = metadata_store[-1]["page"]
-    logical_docs.append(current_doc)
+    if current_pages:
+        logical_docs.append(LogicalDocument(
+            doc_id=f"doc_{doc_counter}",
+            doc_type=current_doc_type,
+            page_start=current_pages[0]["page"],
+            page_end=current_pages[-1]["page"],
+            text="\n\n".join(p["text"] for p in current_pages),
+        ))
+
     return logical_docs
 
 
@@ -183,29 +324,28 @@ def load_pdf(pdf_path: str) -> List[Document]:
     prev_text = None
 
     for page in doc_pages:
-        if not page["text"].strip():
+        if not page.text.strip():
             continue
-
         if prev_text is None:
-            current_doc_type = classify_doc_type(page["text"])
+            current_doc_type = classify_doc_type(page.text)
             page_in_doc = 0
-        elif is_same_document(prev_text, page["text"], current_doc_type):
+        elif is_same_document(prev_text, page.text, current_doc_type):
             page_in_doc += 1
         else:
-            current_doc_type = classify_doc_type(page["text"])
+            current_doc_type = classify_doc_type(page.text)
             page_in_doc = 0
 
-        print(f"  Page {page['page_num']}/{total_pages} | {current_doc_type:<18} | page_in_doc: {page_in_doc}")
+        print(f"  Page {page.page_num}/{total_pages} | {current_doc_type:<18} | page_in_doc: {page_in_doc}")
 
         pdf_metadata_store.append({
-            "page":        page["page_num"],
-            "text":        page["text"],
+            "page":        page.page_num,
+            "text":        page.text,
             "doc_type":    current_doc_type,
             "page_in_doc": page_in_doc,
             "file_id":     file_id,
             "file_name":   file_name,
         })
-        prev_text = page["text"]
+        prev_text = page.text
 
     # Summary table
     print(f"\n{'page':>5}  {'doc_type':<18} {'page_in_doc'}")
@@ -213,7 +353,7 @@ def load_pdf(pdf_path: str) -> List[Document]:
     for m in pdf_metadata_store:
         print(f"  {m['page']:>3}  {m['doc_type']:<18} {m['page_in_doc']}")
 
-    logical_docs = group_logical_docs(pdf_metadata_store, file_name)
+    logical_docs = group_logical_docs(pdf_metadata_store)
     print(f"\n  {len(logical_docs)} logical document(s) identified.\n")
 
     documents = []
@@ -221,11 +361,11 @@ def load_pdf(pdf_path: str) -> List[Document]:
         metadata = {
             "file_id":    file_id,
             "file_name":  file_name,
-            "doc_type":   doc["doc_type"],
-            "page_start": doc["page_start"],
-            "page_end":   doc["page_end"],
+            "doc_type":   doc.doc_type,
+            "page_start": doc.page_start,
+            "page_end":   doc.page_end,
         }
-        documents.append(Document(text=doc["text"], metadata=metadata))
+        documents.append(Document(text=doc.text, metadata=metadata))
 
     return documents
 
@@ -235,7 +375,6 @@ def load_pdf(pdf_path: str) -> List[Document]:
 def build_index(documents: List[Document]) -> VectorStoreIndex:
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     return VectorStoreIndex.from_documents(documents, transformations=[splitter])
-
 
 # --- 4. Hybrid Retriever ------------------------------------------------------
 
@@ -290,18 +429,26 @@ def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
 
 # --- 6. Query Routing ---------------------------------------------------------
 
+
 def predict_query_doc_type(query: str) -> str:
-    """Predict which doc type a query is targeting."""
+    _llm_rate_limiter.check()
     available = list({m["doc_type"] for m in pdf_metadata_store})
+    if not available:
+        return "Other"
+    categories = ", ".join(available)
+    safe_query = sanitize_text(query, max_chars=300)
     prompt = (
-        f'User query: "{query}"\n\n'
-        f"Available document types: {available}\n\n"
-        f"Which type is this query about? Reply with one of: {' | '.join(_DOC_TYPES)}\n"
-        "Type only, no explanation."
+        "You are a document router. Given the query below, pick the single most "
+        "relevant document category from the available list.\n\n"
+        f"Query: {safe_query}\n\n"
+        f"Available categories: {categories}\n\n"
+        "Reply with one category name only — no explanation, no punctuation, no code.\n"
+        "Answer:"
     )
-    raw = str(llm.complete(prompt)).strip()
-    for known in _DOC_TYPES:
-        if known.lower() in raw.lower():
+    with _quiet_llm():
+        response = str(llm.complete(prompt)).strip().split('\n')[0]
+    for known in sorted(_DOC_TYPES, key=len, reverse=True):
+        if known.lower() in response.lower():
             return known
     return "Other"
 
@@ -309,6 +456,12 @@ def predict_query_doc_type(query: str) -> str:
 def retrieve_files_by_doc_type(doc_type: str) -> list:
     return [m for m in pdf_metadata_store if m["doc_type"] == doc_type]
 
+def load_pdfs(paths: List[str]) -> List[Document]:
+    """Load and classify multiple PDF files, merging their metadata stores."""
+    all_docs = []
+    for path in paths:
+        all_docs.extend(load_pdf(path))
+    return all_docs
 
 def build_filtered_engine(index: VectorStoreIndex, doc_type: str) -> RetrieverQueryEngine:
     all_nodes = list(index.docstore.docs.values())
@@ -340,6 +493,12 @@ if __name__ == "__main__":
         if user_query.lower() == "exit":
             print("Exiting. Goodbye!")
             break
+
+        try:
+            user_query = validate_query(user_query)
+        except ValueError as e:
+            print(f"  Invalid query: {e}")
+            continue
 
         predicted_type = predict_query_doc_type(user_query)
         matched = retrieve_files_by_doc_type(predicted_type)
