@@ -310,8 +310,7 @@ def classify_doc_type(text: str) -> str:
         "Category:"
     )
     with _quiet_llm():
-        response = str(llm.complete(prompt)).strip().split('\n')[0]
-    # Longest names first so "Mortgage Contract" is checked before "Contract"
+        response = str(llm.complete(prompt, max_tokens=CLASSIFY_MAX_TOKENS)).strip().split('\n')[0]
     for known in sorted(_DOC_TYPES, key=len, reverse=True):
         if known.lower() in response.lower():
             return known
@@ -320,6 +319,11 @@ def classify_doc_type(text: str) -> str:
 def is_same_document(prev_text: str, curr_text: str, doc_type: str = None) -> bool:
     if not prev_text or not curr_text:
         return False
+
+    # Fast path — heuristics that don't need an LLM call
+    heuristic = _heuristic_same_doc(prev_text, curr_text)
+    if heuristic is not None:
+        return heuristic
 
     _llm_rate_limiter.check()
     prev_sample = sanitize_text(prev_text[-500:] if len(prev_text) > 500 else prev_text, max_chars=500)
@@ -334,7 +338,7 @@ def is_same_document(prev_text: str, curr_text: str, doc_type: str = None) -> bo
         "Reply with a single word — Yes or No — and nothing else."
     )
     with _quiet_llm():
-        response = str(llm.complete(prompt)).strip()
+        response = str(llm.complete(prompt, max_tokens=CLASSIFY_MAX_TOKENS)).strip()
     return response.lower().startswith('yes')
 
 def group_logical_docs(metadata_store: list) -> List[LogicalDocument]:

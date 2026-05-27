@@ -5,7 +5,7 @@ from collections import defaultdict
 import gradio as gr
 import rag_pie
 
-# ── Rate limiting ──────────────────────────────────────────────────────────
+# ── Rate limiting ─────────────────────────────────────────────────────────────
 RATE_LIMIT_MAX  = 20
 RATE_LIMIT_SECS = 60
 MAX_QUERY_LEN   = 500
@@ -28,12 +28,11 @@ def _sanitize(text: str) -> str:
     return text[:MAX_QUERY_LEN].strip()
 
 
-# ── Styles ────────────────────────────────────────────────────────────────
+# ── Styles ────────────────────────────────────────────────────────────────────
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;600&family=Montserrat:wght@300;400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Montserrat:wght@300;400;500&display=swap');
 
-/* ── Base ── */
 *, *::before, *::after { box-sizing: border-box; }
 
 body, .gradio-container {
@@ -43,142 +42,138 @@ body, .gradio-container {
 }
 
 /* ── Header ── */
-#header {
+#app-header {
     background: #1C3D2E;
     border-bottom: 2px solid #B8922E;
-    padding: 1.1rem 2.5rem;
+    padding: 1rem 2.4rem;
     display: flex;
     align-items: center;
-    gap: 1.4rem;
-    margin-bottom: 0 !important;
+    gap: 1.6rem;
 }
-#header-title {
+#app-title {
     font-family: 'Cormorant Garamond', Georgia, serif;
-    font-size: 1.6rem;
+    font-size: 1.55rem;
     font-weight: 600;
     color: #F4EFE6;
-    letter-spacing: 0.06em;
-    line-height: 1;
+    letter-spacing: 0.05em;
+    line-height: 1.1;
 }
-#header-sub {
-    font-family: 'Montserrat', sans-serif;
-    font-size: 0.65rem;
+#app-subtitle {
+    font-size: 0.62rem;
     font-weight: 400;
     color: #7DA882;
-    letter-spacing: 0.22em;
+    letter-spacing: 0.24em;
     text-transform: uppercase;
 }
-#header-divider {
+#header-rule {
     width: 1px;
-    height: 30px;
+    height: 28px;
     background: #B8922E;
-    opacity: 0.45;
+    opacity: 0.4;
     flex-shrink: 0;
 }
 
-/* ── Main layout ── */
-#main-row {
+/* ── Outer wrapper ── */
+#outer-wrap {
+    padding: 1.1rem 1.6rem 1.6rem !important;
     gap: 1.2rem !important;
-    padding: 1.2rem 1.6rem !important;
     align-items: flex-start !important;
 }
 
 /* ── Left panel ── */
-#left-panel {
+#left-col {
     background: #FFFFFF;
-    border: 1px solid #D9D2C5;
-    border-radius: 2px;
-    padding: 1.2rem 1.3rem;
-    min-height: 560px;
+    border: 1px solid #DDD6CA;
+    padding: 1.1rem 1.2rem 1.4rem;
+    min-height: 580px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
 }
-#panel-heading {
+.panel-label {
     font-family: 'Cormorant Garamond', Georgia, serif;
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     font-weight: 600;
-    letter-spacing: 0.18em;
+    letter-spacing: 0.2em;
     text-transform: uppercase;
     color: #B8922E;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid #EAE4DA;
     margin-bottom: 0.9rem;
-    padding-bottom: 0.55rem;
-    border-bottom: 1px solid #E8E2D8;
 }
 #doc-status {
-    font-size: 0.72rem;
+    font-size: 0.73rem;
+    line-height: 1.75;
     color: #6B6B6B;
-    line-height: 1.7;
+    flex: 1;
 }
-#doc-status strong {
-    color: #1C3D2E;
-    font-weight: 500;
-}
-.upload-btn button {
+.upload-wrap button {
     width: 100% !important;
+    margin-top: 1.1rem !important;
     background: transparent !important;
     color: #B8922E !important;
     border: 1px solid #B8922E !important;
     font-family: 'Montserrat', sans-serif !important;
-    font-size: 0.7rem !important;
+    font-size: 0.68rem !important;
     font-weight: 500 !important;
-    letter-spacing: 0.12em !important;
+    letter-spacing: 0.14em !important;
     text-transform: uppercase !important;
     border-radius: 2px !important;
-    padding: 0.55rem !important;
-    margin-top: 1rem !important;
+    padding: 0.52rem 0 !important;
     transition: background 0.15s, color 0.15s;
 }
-.upload-btn button:hover {
+.upload-wrap button:hover {
     background: #B8922E !important;
-    color: #FFFFFF !important;
+    color: #FFF !important;
 }
 
 /* ── Chat panel ── */
-#chat-panel {
-    flex: 1;
-}
 .gr-chatbot, [data-testid="chatbot"] {
     background: #FFFFFF !important;
-    border: 1px solid #D9D2C5 !important;
+    border: 1px solid #DDD6CA !important;
     border-radius: 2px !important;
-    font-family: 'Montserrat', sans-serif !important;
 }
 [data-testid="chatbot"] .user > div,
 .gr-chatbot .message.user > div {
     background: #1C3D2E !important;
     color: #F4EFE6 !important;
+    font-family: 'Montserrat', sans-serif !important;
+    font-size: 0.82rem !important;
+    line-height: 1.6 !important;
     border-radius: 10px 10px 2px 10px !important;
-    font-size: 0.83rem !important;
-    line-height: 1.55 !important;
-    padding: 0.65rem 0.9rem !important;
+    padding: 0.6rem 0.85rem !important;
 }
 [data-testid="chatbot"] .bot > div,
 .gr-chatbot .message.bot > div {
     background: #F9F6F1 !important;
     color: #2A2A2A !important;
+    font-family: 'Montserrat', sans-serif !important;
+    font-size: 0.82rem !important;
+    line-height: 1.7 !important;
     border-left: 3px solid #B8922E !important;
     border-radius: 10px 10px 10px 2px !important;
-    font-size: 0.83rem !important;
-    line-height: 1.65 !important;
-    padding: 0.65rem 0.9rem !important;
+    padding: 0.6rem 0.85rem !important;
 }
 
-/* ── Input row ── */
-#input-row {
-    margin-top: 0.7rem !important;
-    gap: 0.6rem !important;
-    align-items: center !important;
+/* ── Input area ── */
+#input-area {
+    margin-top: 0.65rem !important;
+    gap: 0.55rem !important;
+    align-items: flex-end !important;
 }
-#input-row textarea, #input-row input[type="text"] {
+#input-area textarea {
     background: #FFFFFF !important;
     border: 1px solid #C8BFB0 !important;
     border-radius: 2px !important;
     font-family: 'Montserrat', sans-serif !important;
-    font-size: 0.83rem !important;
+    font-size: 0.82rem !important;
     color: #2A2A2A !important;
-    padding: 0.55rem 0.8rem !important;
+    resize: none !important;
+    min-height: 44px !important;
 }
-#input-row textarea:focus, #input-row input[type="text"]:focus {
+#input-area textarea:focus {
     border-color: #1C3D2E !important;
-    box-shadow: 0 0 0 2px rgba(28,61,46,0.1) !important;
+    box-shadow: 0 0 0 2px rgba(28,61,46,0.09) !important;
     outline: none !important;
 }
 button.primary, .gr-button-primary {
@@ -186,97 +181,117 @@ button.primary, .gr-button-primary {
     color: #F4EFE6 !important;
     font-family: 'Montserrat', sans-serif !important;
     font-weight: 500 !important;
-    font-size: 0.72rem !important;
-    letter-spacing: 0.12em !important;
+    font-size: 0.7rem !important;
+    letter-spacing: 0.13em !important;
     text-transform: uppercase !important;
     border: none !important;
     border-radius: 2px !important;
-    padding: 0.6rem 1.1rem !important;
+    padding: 0.58rem 1rem !important;
+    white-space: nowrap !important;
 }
 button.primary:hover { background: #143023 !important; }
 button.secondary, .gr-button-secondary {
     background: transparent !important;
-    color: #6B6B6B !important;
+    color: #8A8074 !important;
     border: 1px solid #C8BFB0 !important;
     font-family: 'Montserrat', sans-serif !important;
-    font-size: 0.68rem !important;
+    font-size: 0.65rem !important;
     letter-spacing: 0.1em !important;
     text-transform: uppercase !important;
     border-radius: 2px !important;
 }
-button.secondary:hover { border-color: #1C3D2E !important; color: #1C3D2E !important; }
+button.secondary:hover { color: #1C3D2E !important; border-color: #1C3D2E !important; }
 
-/* ── Misc ── */
+/* hide Gradio chrome */
 .gr-box, .gr-panel, .gr-block { border: none !important; background: transparent !important; }
 footer { display: none !important; }
 """
 
 HEADER_HTML = """
-<div id="header">
+<div id="app-header">
   <div>
-    <div id="header-title">The Members&#39; Room</div>
+    <div id="app-title">The Members&#39;&nbsp;Room</div>
+    <div id="app-subtitle">Document Intelligence &nbsp;·&nbsp; Private</div>
   </div>
-  <div id="header-divider"></div>
-  <div id="header-sub">Document Intelligence &nbsp;·&nbsp; Private Access</div>
+  <div id="header-rule"></div>
 </div>
 """
 
-EMPTY_STATUS_HTML = """
-<div id="doc-status">
-  <div style="color:#B8922E; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase;
-              margin-bottom:0.5rem; font-weight:500;">No document loaded</div>
-  Attach a PDF using the button below to begin.
+_STATUS_EMPTY = """
+<div id="doc-status" style="color:#9A9180;">
+  No document loaded.<br><br>
+  Attach a PDF below — it will be parsed automatically.
+</div>
+"""
+
+_STATUS_LOADING = """
+<div id="doc-status" style="color:#B8922E;">
+  Parsing document&hellip;<br><br>
+  <span style="color:#9A9180;font-size:0.68rem;">
+    Classifying pages and building index.
+  </span>
 </div>
 """
 
 
-def _build_status_html(doc_types: list, file_names: list) -> str:
-    types_str = " &nbsp;·&nbsp; ".join(f"<strong>{t}</strong>" for t in sorted(doc_types))
-    files_str = "<br>".join(f"&nbsp;&nbsp;{n}" for n in file_names)
+def _status_html(doc_types: list, file_names: list) -> str:
+    files = "".join(
+        f'<div style="color:#1C3D2E;font-weight:500;margin-bottom:2px;">{n}</div>'
+        for n in file_names
+    )
+    types = " &nbsp;·&nbsp; ".join(
+        f'<span style="color:#1C3D2E;font-weight:500;">{t}</span>'
+        for t in sorted(doc_types)
+    )
     return (
-        '<div id="doc-status">'
-        '<div style="color:#1C3D2E; font-size:0.7rem; letter-spacing:0.1em; text-transform:uppercase;'
-        '            margin-bottom:0.6rem; font-weight:500;">Document loaded</div>'
-        f'<div style="margin-bottom:0.5rem;">{files_str}</div>'
-        f'<div style="margin-top:0.4rem; font-size:0.7rem; color:#6B6B6B;">'
-        f'Types detected:<br><span style="color:#1C3D2E;">{types_str}</span></div>'
-        '</div>'
+        f'<div id="doc-status">'
+        f'<div style="margin-bottom:0.7rem;">{files}</div>'
+        f'<div style="font-size:0.68rem;color:#8A8074;letter-spacing:0.05em;">'
+        f'DETECTED TYPES</div>'
+        f'<div style="margin-top:0.25rem;font-size:0.72rem;line-height:1.9;">{types}</div>'
+        f'</div>'
     )
 
 
-# ── Handlers ─────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+def _msg(role: str, content: str) -> dict:
+    return {"role": role, "content": content}
+
 
 def process_pdfs(pdf_files, history, state):
+    """Called the moment files are attached — parses and indexes immediately."""
     if not pdf_files:
-        return history, state, EMPTY_STATUS_HTML
+        return history, state, _STATUS_EMPTY
 
-    paths = [f.name for f in pdf_files] if isinstance(pdf_files, list) else [pdf_files.name]
-    file_names = [p.split("\\")[-1].split("/")[-1] for p in paths]
+    paths      = [f.name for f in pdf_files] if isinstance(pdf_files, list) else [pdf_files.name]
+    file_names = [p.replace("\\", "/").split("/")[-1] for p in paths]
 
     try:
-        pages = rag_pie.load_pdfs(paths)
-        index = rag_pie.build_index(pages)
+        docs   = rag_pie.load_pdfs(paths)
+        index  = rag_pie.build_index(docs)
         engine = rag_pie.build_rag_pipeline(index)
-    except Exception as e:
-        err_msg = f"Error loading documents: {e}"
-        return history + [{"role": "assistant", "content": err_msg}], state, EMPTY_STATUS_HTML
+    except Exception as exc:
+        return (
+            history + [_msg("assistant", f"Error loading document: {exc}")],
+            state,
+            _STATUS_EMPTY,
+        )
 
-    state = {"index": index, "engine": engine}
-
+    state     = {"index": index, "engine": engine}
     doc_types = sorted({m["doc_type"] for m in rag_pie.pdf_metadata_store})
-    n = len(paths)
-    welcome = (
-        f"**{n} file{'s' if n > 1 else ''} loaded** — {', '.join(file_names)}\n\n"
-        f"Documents identified: {', '.join(doc_types)}\n\n"
-        "Ready — ask me anything about your documents."
-    )
+    n         = len(paths)
 
-    status_html = _build_status_html(doc_types, file_names)
-    return history + [{"role": "assistant", "content": welcome}], state, status_html
+    msg = (
+        f"**{n} file{'s' if n > 1 else ''} loaded** — {', '.join(file_names)}\n\n"
+        f"Document types found: {', '.join(doc_types)}\n\n"
+        "Ready. Ask me anything about your documents."
+    )
+    return history + [_msg("assistant", msg)], state, _status_html(doc_types, file_names)
 
 
 def answer_query(query, history, state, request: gr.Request):
-    ip = request.client.host if request else "unknown"
+    ip    = request.client.host if request else "unknown"
     query = _sanitize(query)
 
     if not query:
@@ -285,108 +300,108 @@ def answer_query(query, history, state, request: gr.Request):
 
     if not _check_rate_limit(ip):
         yield history + [
-            {"role": "user",      "content": query},
-            {"role": "assistant", "content": "Too many requests — please wait a moment and try again."},
+            _msg("user", query),
+            _msg("assistant", "Too many requests — please wait before trying again."),
         ], state, ""
         return
 
     if not state or "index" not in state:
         yield history + [
-            {"role": "user",      "content": query},
-            {"role": "assistant", "content": "Please attach a PDF using the button on the left."},
+            _msg("user", query),
+            _msg("assistant", "Please attach a PDF first using the button on the left."),
         ], state, ""
         return
 
+    # Show thinking placeholder immediately so the user sees activity
+    history = history + [_msg("user", query), _msg("assistant", "…")]
+    yield history, state, ""
+
     predicted_type = rag_pie.predict_query_doc_type(query)
     matched        = rag_pie.retrieve_files_by_doc_type(predicted_type) if predicted_type else []
-    query_engine   = (
+    engine         = (
         rag_pie.build_filtered_engine(state["index"], predicted_type)
         if matched else state["engine"]
     )
 
-    streaming_response = query_engine.query(query)
-
-    partial = ""
-    history = history + [
-        {"role": "user",      "content": query},
-        {"role": "assistant", "content": ""},
-    ]
-    for token in streaming_response.response_gen:
-        partial += token
-        history[-1]["content"] = partial
-        yield history, state, ""
+    response = engine.query(query)
+    answer   = str(response).strip()
 
     sources = [
         f"p.{m.get('page_start')}–{m.get('page_end')} · {m.get('doc_type')} · {m.get('file_name')}"
-        for node in streaming_response.source_nodes
+        for node in response.source_nodes
         for m in [node.metadata]
     ]
     if sources:
-        history[-1]["content"] = partial + "\n\n*Sources: " + " | ".join(sources) + "*"
+        answer += "\n\n*Sources: " + " | ".join(sources) + "*"
 
+    history[-1] = _msg("assistant", answer)
     yield history, state, ""
 
 
-# ── Layout ───────────────────────────────────────────────────────────────
+# ── Layout ────────────────────────────────────────────────────────────────────
 
-with gr.Blocks(title="The Members' Room", css=CSS) as demo:
+with gr.Blocks(css=CSS, theme=gr.themes.Base()) as demo:
     gr.HTML(HEADER_HTML)
 
-    state = gr.State({})
+    _state = gr.State({})
 
-    with gr.Row(elem_id="main-row", equal_height=False):
+    with gr.Row(elem_id="outer-wrap", equal_height=False):
 
-        # Left panel — document info + upload
-        with gr.Column(scale=1, min_width=210, elem_id="left-panel"):
-            gr.HTML('<div id="panel-heading">Documents</div>')
-            doc_status = gr.HTML(EMPTY_STATUS_HTML)
-            upload_btn = gr.UploadButton(
-                "Attach PDF",
-                file_types=[".pdf"],
-                file_count="multiple",
-                variant="secondary",
-                elem_classes=["upload-btn"],
-            )
+        # ── Left: document panel ──────────────────────────────────────────
+        with gr.Column(scale=1, min_width=200, elem_id="left-col"):
+            gr.HTML('<div class="panel-label">Documents</div>')
+            doc_status = gr.HTML(_STATUS_EMPTY)
+            with gr.Group(elem_classes=["upload-wrap"]):
+                upload_btn = gr.UploadButton(
+                    "Attach PDF",
+                    file_types=[".pdf"],
+                    file_count="multiple",
+                    variant="secondary",
+                )
 
-        # Right panel — chat
-        with gr.Column(scale=4, elem_id="chat-panel"):
+        # ── Right: chat ───────────────────────────────────────────────────
+        with gr.Column(scale=4):
             chatbot = gr.Chatbot(
+                value=[],
                 height=520,
                 label="",
                 show_label=False,
-                bubble_full_width=False,
             )
-            with gr.Row(elem_id="input-row"):
+            with gr.Row(elem_id="input-area"):
                 query_box = gr.Textbox(
-                    placeholder="Ask about your documents...",
+                    placeholder="Ask about your documents…",
                     label="",
                     scale=5,
                     container=False,
                     lines=1,
+                    max_lines=4,
                 )
-                send_btn = gr.Button("Send", variant="primary", scale=1, size="sm")
-
+                send_btn = gr.Button("Send", variant="primary", scale=1, min_width=80)
             with gr.Row():
-                clear_btn = gr.Button("Clear", variant="secondary", size="sm", scale=0)
+                clear_btn = gr.Button("Clear conversation", variant="secondary", size="sm", scale=0)
 
-    # Wiring
+    # ── Event wiring ─────────────────────────────────────────────────────────
     upload_btn.upload(
         process_pdfs,
-        inputs=[upload_btn, chatbot, state],
-        outputs=[chatbot, state, doc_status],
+        inputs=[upload_btn, chatbot, _state],
+        outputs=[chatbot, _state, doc_status],
     )
     send_btn.click(
         answer_query,
-        inputs=[query_box, chatbot, state],
-        outputs=[chatbot, state, query_box],
+        inputs=[query_box, chatbot, _state],
+        outputs=[chatbot, _state, query_box],
     )
     query_box.submit(
         answer_query,
-        inputs=[query_box, chatbot, state],
-        outputs=[chatbot, state, query_box],
+        inputs=[query_box, chatbot, _state],
+        outputs=[chatbot, _state, query_box],
     )
-    clear_btn.click(lambda: ([], {}), None, [chatbot, state])
+    clear_btn.click(
+        lambda: ([], {}, _STATUS_EMPTY),
+        inputs=None,
+        outputs=[chatbot, _state, doc_status],
+    )
 
 
 if __name__ == "__main__":
-    demo.launch(share=True, theme=gr.themes.Base())
+    demo.launch(share=True)
