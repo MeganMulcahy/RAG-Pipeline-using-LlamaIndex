@@ -36,8 +36,8 @@ Upload a mortgage PDF and ask plain-English questions. The system extracts text,
 
 2. Create a `.env` file:
    ```
-   GOOGLE_API_KEY=your_key_here
-   GOOGLE_MODEL=your_model_here
+   GEMINI_API_KEY=your_key_here
+   QUERY_DOC_TYPE_ROUTING=false
    ```
 
 3. Run:
@@ -45,3 +45,14 @@ Upload a mortgage PDF and ask plain-English questions. The system extracts text,
    python rag_pipeline.py
    ```
    Enter a PDF path when prompted, then ask questions. Type `exit` to quit.
+
+## Architecture Progress Tracker
+
+| Date | Status | Details |
+|---|---|---|
+| 2026-05-28 | Current Pipeline | PDF extraction (PyMuPDF + Tesseract OCR fallback); classification + boundary detection + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex); optional query routing |
+| Planned | Step 1 | Multi-format support beyond PDF (Word, Excel, slides, web pages) |
+| Planned | Step 2 | Document layout analysis before chunking (separate headers, tables, figures) |
+| Planned | Step 3 | Table recognition/extraction as structured data |
+| Planned | Step 4 | Storage/serving layer: object storage + metadata DB + async ingestion queue |
+| Planned | Step 5 | Retrieval/API scale-up: dedicated vector DB, sparse service, REST auth, multi-tenant knowledge bases |
