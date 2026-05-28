@@ -1,60 +1,146 @@
+"""
+rag_pipeline.py  —  Gemini-powered RAG pipeline
+
+Structure
+---------
+1. Config & setup
+2. Data classes        (PageInfo, LogicalDocument)
+3. PDF extraction      (blob_reader — fitz + OCR fallback)
+4. Classification      (keyword labels; Gemini only if INGEST_LLM=true)
+5. Boundary detection  (heuristics; Gemini only if INGEST_LLM=true)
+6. Document grouping   (group_logical_docs)
+7. PDF loading         (load_pdf → LlamaIndex Documents)
+8. Indexing            (build_index — SentenceSplitter)
+9. Hybrid retrieval    (HybridRetriever — BM25 + vector)
+10. Pipeline           (build_rag_pipeline, build_filtered_engine)
+11. Query routing      (optional keyword filter; full-index search by default)
+12. CLI entry point
+"""
+
+import io
+import logging
 import os
 import re
-import time
 import uuid
-import logging
-from collections import deque
-from dotenv import load_dotenv
-from typing import List, Optional, Dict
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import fitz  # PyMuPDF
 import google.generativeai as genai
-from dataclasses import dataclass
-from llama_index.core import Document, VectorStoreIndex, Settings
+from dotenv import load_dotenv
+from llama_index.core import Document, Settings, VectorStoreIndex
+from llama_index.core.llms import CompletionResponse, CustomLLM, LLMMetadata
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
-from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
+from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
 
-load_dotenv()
+load_dotenv(override=True)
 
-for _noisy in ("httpx", "huggingface_hub", "huggingface_hub.file_download", "sentence_transformers"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# --- CONFIG -------------------------------------------------------------------
+# Silence chatty third-party loggers
+for _log in ("httpx", "huggingface_hub", "sentence_transformers"):
+    logging.getLogger(_log).setLevel(logging.WARNING)
 
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL      = "models/gemini-3.1-flash-lite"
-EMBEDDING_MODEL   = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE        = 512
-CHUNK_OVERLAP     = 100
-TOP_K             = 4
-MAX_PDF_SIZE_MB   = 50
-MAX_PDF_PAGES     = 300
-MAX_QUERY_LEN     = 500
-LLM_CALLS_PER_MIN = 60
 
-# --- Gemini Setup -------------------------------------------------------------
+# =============================================================================
+# 1. CONFIG
+# =============================================================================
+
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = "models/gemini-3.1-flash-lite"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE      = 512
+CHUNK_OVERLAP   = 100
+TOP_K           = 4
+
+# Query: pre-filter by doc_type keywords (set true to enable). Default searches full index.
+QUERY_DOC_TYPE_ROUTING = os.getenv("QUERY_DOC_TYPE_ROUTING", "false").lower() == "true"
+
+_DOC_TYPES = [
+    "Resume", "Contract", "Mortgage Contract", "Invoice", "Pay Slip",
+    "Lender Fee Sheet", "Land Deed", "Bank Statement", "Tax Document",
+    "Insurance", "Report", "Letter", "Form", "ID Document", "Medical", "Other",
+]
+
+_KEYWORD_RULES = [
+    ("Resume",            ["resume", "curriculum vitae", " cv ", "work experience", "education", "skills", "objective"]),
+    ("Lender Fee Sheet",  ["loan estimate", "closing disclosure", "origination charge", "apr", "annual percentage rate",
+                           "discount point", "closing cost", "lender credit", "prepaid interest", "cash to close"]),
+    ("Mortgage Contract", ["mortgage", "deed of trust", "promissory note", "deed of mortgage", "home loan"]),
+    ("Contract",          ["agreement", "whereas", "hereinafter", "obligations", "parties agree", "terms and conditions"]),
+    ("Invoice",           ["invoice", "bill to", "amount due", "payment terms", "subtotal", "purchase order"]),
+    ("Pay Slip",          ["pay stub", "pay slip", "payslip", "gross pay", "net pay", "deductions", "ytd", "federal tax"]),
+    ("Land Deed",         ["deed", "grantor", "grantee", "real property", "parcel", "legal description", "county recorder"]),
+    ("Bank Statement",    ["account number", "statement period", "beginning balance", "ending balance", "deposits", "withdrawals"]),
+    ("Tax Document",      ["form w-2", "form 1099", "form 1040", "taxable income", "withholding", "irs", "tax return"]),
+    ("Insurance",         ["policy number", "insured", "coverage", "premium", "deductible", "beneficiary", "underwriter"]),
+    ("Medical",           ["patient", "diagnosis", "physician", "prescription", "medical record", "treatment", "dosage"]),
+]
+
+_PAGE_RE = re.compile(r'\bpage\s+\d+\s+of\s+\d+\b', re.IGNORECASE)
+
+
+def _keyword_classify(text: str) -> Optional[str]:
+    """Return a doc type if 2+ keywords match, else None."""
+    lower = text.lower()
+    for doc_type, keywords in _KEYWORD_RULES:
+        if sum(1 for kw in keywords if kw in lower) >= 2:
+            return doc_type
+    return None
+
+
+def _heuristic_boundary(curr_text: str) -> Optional[bool]:
+    """
+    Returns True  → definitely same doc.
+    Returns None  → uncertain (keyword mismatch rule decides).
+    """
+    stripped = curr_text.strip()
+    if len(stripped) < 120:
+        return True   # blank / near-blank page → continuation
+    if _PAGE_RE.search(stripped):
+        return True   # "Page N of M" header/footer → continuation
+    return None
+
+
+_QUERY_ROUTING_RULES = [
+    ("Lender Fee Sheet",  ["origination", "closing cost", "discount point", "appraisal fee", "apr"]),
+    ("Pay Slip",          ["salary", "gross pay", "net pay", "paycheck", "deductions", "ytd"]),
+    ("Bank Statement",    ["account balance", "deposits", "withdrawals", "bank statement"]),
+    ("Tax Document",      ["w-2", "1099", "taxable income", "irs", "tax return"]),
+    ("Invoice",           ["invoice", "bill to", "amount due", "purchase order"]),
+    ("Mortgage Contract", ["mortgage", "promissory note", "deed of trust", "escrow", "loan amount"]),
+    ("Land Deed",         ["grantor", "grantee", "parcel", "legal description"]),
+    ("Contract",          ["agreement", "obligations", "indemnification", "whereas"]),
+    ("Resume",            ["resume", "work experience", "employment history"]),
+    ("Insurance",         ["policy number", "premium", "coverage", "deductible"]),
+    ("Medical",           ["diagnosis", "prescription", "patient", "physician"]),
+]
+
+
+# =============================================================================
+# 2. GEMINI + EMBEDDING SETUP
+# =============================================================================
 
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found. Add it to your .env file.")
+    raise ValueError("GEMINI_API_KEY not set. Add it to your .env file.")
 
+_key_preview = f"{GEMINI_API_KEY[:4]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 8 else "too short"
+logging.info("Gemini key loaded: %s (len=%d)", _key_preview, len(GEMINI_API_KEY))
 genai.configure(api_key=GEMINI_API_KEY)
 _gemini = genai.GenerativeModel(GEMINI_MODEL)
 
-embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
-Settings.embed_model = embed_model
 
-class _GeminiLLM(CustomLLM):
-    """Thin LlamaIndex-compatible wrapper around google.generativeai."""
+class GeminiLLM(CustomLLM):
+    """Minimal LlamaIndex-compatible wrapper around google.generativeai."""
     context_window: int = 8192
-    num_output: int = 512
-    model_name: str = GEMINI_MODEL
+    num_output: int     = 1024
+    model_name: str     = GEMINI_MODEL
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -65,106 +151,49 @@ class _GeminiLLM(CustomLLM):
         )
 
     def complete(self, prompt: str, **_) -> CompletionResponse:
-        _rate_limiter.check()
         text = _gemini.generate_content(prompt).text or ""
         return CompletionResponse(text=text.strip())
 
     def stream_complete(self, prompt: str, **_):
         yield self.complete(prompt)
 
-_llm = _GeminiLLM()
-Settings.llm = _llm
 
-# --- Security -----------------------------------------------------------------
+_llm        = GeminiLLM()
+_embed      = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
+Settings.llm         = _llm
+Settings.embed_model = _embed
 
-class RateLimiter:
-    def __init__(self, max_calls: int, window_seconds: int = 60):
-        self._max_calls = max_calls
-        self._window = window_seconds
-        self._timestamps: deque = deque()
 
-    def check(self):
-        now = time.monotonic()
-        cutoff = now - self._window
-        while self._timestamps and self._timestamps[0] < cutoff:
-            self._timestamps.popleft()
-        if len(self._timestamps) >= self._max_calls:
-            raise RuntimeError(
-                f"Rate limit exceeded: max {self._max_calls} calls per {self._window}s."
-            )
-        self._timestamps.append(now)
-
-_rate_limiter = RateLimiter(max_calls=LLM_CALLS_PER_MIN)
-
-_INJECTION_PATTERNS = re.compile(
-    r"(ignore\s+(all\s+)?previous\s+instructions?|"
-    r"disregard\s+(all\s+)?prior\s+(instructions?|context)|"
-    r"you\s+are\s+now\s+a|"
-    r"new\s+instructions?:|"
-    r"system\s*:\s*you|"
-    r"<\s*/?(?:system|user|assistant|prompt|instruction)\s*>)",
-    re.IGNORECASE,
-)
-
-def sanitize_text(text: str, max_chars: int = 2000) -> str:
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-    text = _INJECTION_PATTERNS.sub("[REMOVED]", text)
-    return text[:max_chars]
-
-def validate_pdf_path(pdf_path: str) -> None:
-    real = os.path.realpath(pdf_path)
-    if not os.path.isfile(real):
-        raise ValueError(f"File not found: {pdf_path}")
-    if not real.lower().endswith(".pdf"):
-        raise ValueError(f"Not a PDF file: {pdf_path}")
-    size_mb = os.path.getsize(real) / (1024 * 1024)
-    if size_mb > MAX_PDF_SIZE_MB:
-        raise ValueError(f"PDF too large ({size_mb:.1f} MB). Limit: {MAX_PDF_SIZE_MB} MB")
-
-def validate_query(query: str) -> str:
-    if not query or not query.strip():
-        raise ValueError("Query cannot be empty.")
-    if len(query) > MAX_QUERY_LEN:
-        raise ValueError(f"Query too long ({len(query)} chars). Limit: {MAX_QUERY_LEN}.")
-    return sanitize_text(query, max_chars=MAX_QUERY_LEN)
-
-# --- Dataclasses --------------------------------------------------------------
+# =============================================================================
+# 3. DATA CLASSES
+# =============================================================================
 
 @dataclass
 class PageInfo:
-    page_num: int
-    text: str
-    doc_type: Optional[str] = None
-    page_in_doc: int = 0
+    page_num:   int
+    text:       str
+    doc_type:   Optional[str] = None
+    page_in_doc: int          = 0
+
 
 @dataclass
 class LogicalDocument:
-    doc_id: str
-    doc_type: str
+    doc_id:     str
+    doc_type:   str
     page_start: int
-    page_end: int
-    text: str
-    chunks: Optional[List[Dict]] = None
+    page_end:   int
+    text:       str
 
-_DOC_TYPES = [
-    "Resume", "Contract", "Mortgage Contract", "Invoice", "Pay Slip",
-    "Lender Fee Sheet", "Land Deed", "Bank Statement", "Tax Document",
-    "Insurance", "Report", "Letter", "Form", "ID Document", "Medical", "Other",
-]
 
-# --- Gemini helper ------------------------------------------------------------
-
-def _gemini_complete(prompt: str) -> str:
-    _rate_limiter.check()
-    try:
-        return _gemini.generate_content(prompt).text.strip()
-    except Exception as e:
-        logging.warning(f"Gemini call failed: {e}")
-        return ""
-
-# --- PDF Extraction -----------------------------------------------------------
+# =============================================================================
+# 4. PDF EXTRACTION
+# =============================================================================
 
 def blob_reader(pdf_path) -> List[PageInfo]:
+    """
+    Open a PDF from a file path, file-like object, or dict with 'content' key.
+    Extracts text per page; falls back to pytesseract OCR for scanned pages.
+    """
     if isinstance(pdf_path, dict) and "content" in pdf_path:
         doc = fitz.open(stream=pdf_path["content"], filetype="pdf")
     elif hasattr(pdf_path, "read"):
@@ -172,223 +201,262 @@ def blob_reader(pdf_path) -> List[PageInfo]:
     else:
         doc = fitz.open(pdf_path)
 
-    if len(doc) > MAX_PDF_PAGES:
-        doc.close()
-        raise ValueError(f"PDF has {len(doc)} pages. Limit: {MAX_PDF_PAGES}.")
-
-    pages = []
+    pages: List[PageInfo] = []
     for i, page in enumerate(doc):
         text = page.get_text()
+
         if not text.strip():
             try:
                 from PIL import Image
                 import pytesseract
-                import io
-                pix = page.get_pixmap()
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                pix  = page.get_pixmap()
+                img  = Image.open(io.BytesIO(pix.tobytes("png")))
                 text = pytesseract.image_to_string(img)
+                print(f"  Page {i}: OCR extracted {len(text)} chars")
             except Exception as e:
-                logging.warning(f"Page {i}: OCR failed - {e}")
+                logging.warning(f"Page {i}: OCR failed — {e}")
                 text = ""
+
         pages.append(PageInfo(page_num=i, text=text))
 
     doc.close()
     return pages
 
-# --- Classification & Boundary Detection -------------------------------------
+
+# =============================================================================
+# 5. DOCUMENT CLASSIFICATION
+# =============================================================================
 
 def classify_document_type(text: str) -> str:
-    text_sample = sanitize_text(text, max_chars=1500)
-    prompt = (
-        "You are a document classifier. Output exactly one category name — nothing else.\n\n"
-        "Categories:\n"
-        "Resume, Contract, Mortgage Contract, Invoice, Pay Slip, Lender Fee Sheet, "
-        "Land Deed, Bank Statement, Tax Document, Insurance, Report, Letter, Form, "
-        "ID Document, Medical, Other\n\n"
-        "IMPORTANT DISTINCTIONS:\n"
-        "- Lender Fee Sheet = a FEE SCHEDULE listing loan costs (origination fee, appraisal, "
-        "  title insurance, discount points, APR, closing costs). It is NOT a contract. "
-        "  Look for: 'Loan Estimate', 'Closing Disclosure', 'Good Faith Estimate', "
-        "  'origination charges', 'APR', 'discount points', 'lender credits', 'title service fees'.\n"
-        "- Contract = a legal agreement with parties, obligations, clauses. "
-        "  Look for: 'AGREEMENT', 'WHEREAS', 'IN WITNESS WHEREOF', 'the parties agree'.\n"
-        "- Mortgage Contract = a HOME LOAN agreement (not a fee sheet). "
-        "  Look for: 'mortgage', 'promissory note', 'deed of trust', 'borrower', 'principal'.\n\n"
-        "Examples:\n"
-        'Sample: "EMPLOYMENT AGREEMENT entered into between..." -> Contract\n'
-        'Sample: "ANNEXURE A forms part of the Agreement dated..." -> Contract\n'
-        'Sample: "LEASE AGREEMENT between Landlord and Tenant..." -> Contract\n'
-        'Sample: "NON-DISCLOSURE AGREEMENT parties agree to keep confidential..." -> Contract\n'
-        'Sample: "Loan Estimate  Origination Charges $1,500  Appraisal Fee $450  APR 6.75%..." -> Lender Fee Sheet\n'
-        'Sample: "Closing Disclosure  Total Loan Costs  Discount Points 0.5%  Lender Credits..." -> Lender Fee Sheet\n'
-        'Sample: "Good Faith Estimate  Loan origination fee 1%  Credit report $35  Title insurance $800..." -> Lender Fee Sheet\n'
-        'Sample: "Lender Fee Worksheet  Processing fee $500  Underwriting $895  Recording fee $125..." -> Lender Fee Sheet\n'
-        'Sample: "PAY STUB  Employee: John Smith  Gross Pay: $3,200  Net Pay: $2,450..." -> Pay Slip\n'
-        'Sample: "MORTGAGE AGREEMENT  This Home Loan is made between Borrower and Lender..." -> Mortgage Contract\n\n'
-        f"Document sample:\n{text_sample}\n\n"
-        "Category:"
-    )
-    response = _gemini_complete(prompt)
-    for known in sorted(_DOC_TYPES, key=len, reverse=True):
-        if known.lower() in response.lower():
-            return known
+    """Keyword label for metadata."""
+    fast = _keyword_classify(text)
+    if fast:
+        return fast
     return "Other"
 
-def detect_document_boundary(prev_text: str, curr_text: str, doc_type: str = None) -> bool:
+
+# =============================================================================
+# 6. BOUNDARY DETECTION
+# =============================================================================
+
+def detect_document_boundary(prev_text: str, curr_text: str,
+                              doc_type: str = None) -> bool:
+    """
+    Returns True if the two pages belong to the SAME document.
+    Heuristics first; then keyword mismatch rule.
+    """
     if not prev_text or not curr_text:
         return False
-    prev_sample = sanitize_text(prev_text[-500:], max_chars=500)
-    curr_sample = sanitize_text(curr_text[:500], max_chars=500)
-    prompt = (
-        "You are a document boundary detector. "
-        f"The current document type is: {doc_type or 'Unknown'}.\n\n"
-        f"End of previous page:\n...{prev_sample}\n\n"
-        f"Start of current page:\n{curr_sample}...\n\n"
-        "Do these two pages belong to the same document? "
-        "Reply with a single word — Yes or No — and nothing else."
-    )
-    response = _gemini_complete(prompt)
-    return response.lower().startswith("yes")
 
-# --- Logical Document Grouping ------------------------------------------------
+    hint = _heuristic_boundary(curr_text)
+    if hint is not None:
+        return hint
+
+    prev_kw = _keyword_classify(prev_text)
+    curr_kw = _keyword_classify(curr_text)
+    if prev_kw and curr_kw and prev_kw != curr_kw:
+        return False
+    return True
+
+
+# =============================================================================
+# 7. DOCUMENT GROUPING
+# =============================================================================
 
 def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
-    logical_docs = []
-    current_pages: List[PageInfo] = []
-    current_type = None
-    doc_counter = 0
+    """Group a flat list of classified PageInfo objects into logical documents."""
+    logical_docs: List[LogicalDocument] = []
+    current_pages: List[PageInfo]       = []
+    current_type: Optional[str]         = None
+    doc_counter                         = 0
 
     for page in pages:
         if not page.text.strip():
             continue
+
         if page.page_in_doc == 0 and current_pages:
             logical_docs.append(LogicalDocument(
-                doc_id=f"doc_{doc_counter}",
-                doc_type=current_type,
-                page_start=current_pages[0].page_num,
-                page_end=current_pages[-1].page_num,
-                text="\n\n".join(p.text for p in current_pages),
+                doc_id     = f"doc_{doc_counter}",
+                doc_type   = current_type,
+                page_start = current_pages[0].page_num,
+                page_end   = current_pages[-1].page_num,
+                text       = "\n\n".join(p.text for p in current_pages),
             ))
             doc_counter += 1
             current_pages = []
+
         current_pages.append(page)
         current_type = page.doc_type
 
     if current_pages:
         logical_docs.append(LogicalDocument(
-            doc_id=f"doc_{doc_counter}",
-            doc_type=current_type,
-            page_start=current_pages[0].page_num,
-            page_end=current_pages[-1].page_num,
-            text="\n\n".join(p.text for p in current_pages),
+            doc_id     = f"doc_{doc_counter}",
+            doc_type   = current_type,
+            page_start = current_pages[0].page_num,
+            page_end   = current_pages[-1].page_num,
+            text       = "\n\n".join(p.text for p in current_pages),
         ))
+
     return logical_docs
 
-# --- PDF Loading --------------------------------------------------------------
 
-pdf_metadata_store: List[Dict] = []
+# =============================================================================
+# 8. PDF LOADING  →  LlamaIndex Documents
+# =============================================================================
+
+pdf_metadata_store: List[Dict] = []   # populated by load_pdf; used for routing
+
 
 def load_pdf(pdf_path) -> List[Document]:
+    """
+    Full ingestion pipeline for one PDF:
+      blob_reader → keyword classify → heuristic boundaries → group → Documents
+    """
     global pdf_metadata_store
     pdf_metadata_store = []
 
-    pages = blob_reader(pdf_path)
+    pages     = blob_reader(pdf_path)
     file_name = (
         os.path.basename(pdf_path.name) if hasattr(pdf_path, "name")
         else os.path.basename(str(pdf_path))
     )
-    file_id = str(uuid.uuid4())
+    file_id     = str(uuid.uuid4())
     total_pages = len(pages)
+    non_empty   = [(i, p) for i, p in enumerate(pages) if p.text.strip()]
 
-    current_type = None
+    print(f"\n  Labeling {len(non_empty)}/{total_pages} pages (keywords + continuity)…")
+    for page in pages:
+        if page.text.strip():
+            # Keep raw keyword label only; if absent, decide later using boundary continuity.
+            page.doc_type = _keyword_classify(page.text)
+
     page_in_doc = 0
-    prev_text = None
+    prev_page: Optional[PageInfo] = None
 
     for page in pages:
         if not page.text.strip():
             continue
-        if prev_text is None:
-            current_type = classify_document_type(page.text)
+
+        if prev_page is None:
+            if not page.doc_type:
+                page.doc_type = "Other"
             page_in_doc = 0
-        elif detect_document_boundary(prev_text, page.text, current_type):
-            page_in_doc += 1
         else:
-            current_type = classify_document_type(page.text)
-            page_in_doc = 0
+            prev_type = prev_page.doc_type or "Other"
+            curr_type = page.doc_type
+            same = detect_document_boundary(prev_page.text, page.text, prev_type)
 
-        page.doc_type = current_type
+            if curr_type is None:
+                # No new keyword hit on this page: inherit type if boundary says continuation.
+                if same:
+                    page.doc_type = prev_type
+                    page_in_doc += 1
+                else:
+                    page.doc_type = "Other"
+                    page_in_doc = 0
+            elif curr_type != prev_type:
+                # Strong keyword shift starts a new logical document.
+                page_in_doc = 0
+            else:
+                page_in_doc = page_in_doc + 1 if same else 0
+
         page.page_in_doc = page_in_doc
+        prev_page        = page
 
-        print(f"  Page {page.page_num}/{total_pages} | {current_type:<18} | page_in_doc: {page_in_doc}")
+        print(f"  Page {page.page_num + 1}/{total_pages} | {page.doc_type:<20} | page_in_doc: {page_in_doc}")
 
         pdf_metadata_store.append({
             "page":        page.page_num,
             "text":        page.text,
-            "doc_type":    current_type,
+            "doc_type":    page.doc_type,
             "page_in_doc": page_in_doc,
             "file_id":     file_id,
             "file_name":   file_name,
         })
-        prev_text = page.text
 
     logical_docs = group_logical_docs(pages)
-    print(f"\n  {len(logical_docs)} logical document(s) identified.\n")
+    print(f"\n  {len(logical_docs)} logical document(s) identified.")
 
-    documents = []
-    for doc in logical_docs:
-        documents.append(Document(
-            text=doc.text,
-            metadata={
+    return [
+        Document(
+            text     = doc.text,
+            metadata = {
                 "file_id":    file_id,
                 "file_name":  file_name,
                 "doc_type":   doc.doc_type,
                 "page_start": doc.page_start,
                 "page_end":   doc.page_end,
             },
-        ))
-    return documents
+        )
+        for doc in logical_docs
+    ]
+
 
 def load_pdfs(paths: List[str]) -> List[Document]:
-    all_docs = []
+    """Load and classify multiple PDF files."""
+    all_docs: List[Document] = []
     for path in paths:
         all_docs.extend(load_pdf(path))
     return all_docs
 
-# --- Index & Hybrid Retriever ------------------------------------------------
+
+# =============================================================================
+# 9. INDEXING
+# =============================================================================
 
 def build_index(documents: List[Document]) -> VectorStoreIndex:
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     return VectorStoreIndex.from_documents(documents, transformations=[splitter])
 
+
+# =============================================================================
+# 10. HYBRID RETRIEVER
+# =============================================================================
+
 class HybridRetriever(BaseRetriever):
+    """Merges BM25 (keyword) and vector results, deduplicated by node ID."""
+
     def __init__(self, vector_retriever, bm25_retriever, top_k: int = TOP_K):
         self.vector_retriever = vector_retriever
-        self.bm25_retriever = bm25_retriever
-        self.top_k = top_k
+        self.bm25_retriever   = bm25_retriever
+        self.top_k            = top_k
         super().__init__()
 
     def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
-        vector_nodes = self.vector_retriever.retrieve(query_bundle)
+        vector_nodes  = self.vector_retriever.retrieve(query_bundle)
         keyword_nodes = self.bm25_retriever.retrieve(query_bundle)
-        unique: Dict[str, NodeWithScore] = {}
+
+        seen:   Dict[str, NodeWithScore] = {}
         for node in vector_nodes + keyword_nodes:
-            if node.node_id not in unique:
-                unique[node.node_id] = node
+            if node.node_id not in seen:
+                seen[node.node_id] = node
+
         return sorted(
-            unique.values(),
-            key=lambda x: x.score if x.score is not None else 0.0,
+            seen.values(),
+            key=lambda n: n.score if n.score is not None else 0.0,
             reverse=True,
         )[:self.top_k]
 
-def _make_engine(index: VectorStoreIndex, nodes, doc_type: str = None) -> RetrieverQueryEngine:
+
+# =============================================================================
+# 11. PIPELINE ASSEMBLY
+# =============================================================================
+
+def _make_engine(
+    index: VectorStoreIndex,
+    nodes: list,
+    doc_type_filter: Optional[str] = None,
+) -> RetrieverQueryEngine:
     safe_k = min(TOP_K, max(1, len(nodes)))
-    if doc_type:
-        filters = MetadataFilters(filters=[MetadataFilter(key="doc_type", value=doc_type)])
+
+    if doc_type_filter:
+        filters         = MetadataFilters(filters=[MetadataFilter(key="doc_type", value=doc_type_filter)])
         vector_retriever = index.as_retriever(similarity_top_k=safe_k, filters=filters)
     else:
         vector_retriever = index.as_retriever(similarity_top_k=safe_k)
+
     bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=safe_k)
-    hybrid = HybridRetriever(vector_retriever, bm25_retriever, top_k=safe_k)
+    hybrid         = HybridRetriever(vector_retriever, bm25_retriever, top_k=safe_k)
 
     postprocessors = []
     if len(nodes) > 1:
@@ -398,91 +466,95 @@ def _make_engine(index: VectorStoreIndex, nodes, doc_type: str = None) -> Retrie
                 top_n=min(TOP_K, len(nodes)),
             )]
         except Exception as e:
-            logging.warning(f"Reranker unavailable (skipping): {e}")
+            logging.warning(f"Reranker unavailable: {e}")
 
-    kwargs = dict(retriever=hybrid, node_postprocessors=postprocessors)
-    if _llm:
-        kwargs["llm"] = _llm
-    return RetrieverQueryEngine.from_args(**kwargs)
+    return RetrieverQueryEngine.from_args(
+        retriever        = hybrid,
+        llm              = _llm,
+        node_postprocessors = postprocessors,
+    )
+
 
 def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
     nodes = list(index.docstore.docs.values())
     return _make_engine(index, nodes)
 
-def build_filtered_engine(index: VectorStoreIndex, doc_type: str) -> Optional[RetrieverQueryEngine]:
+
+def build_filtered_engine(
+    index: VectorStoreIndex, doc_type: str
+) -> Optional[RetrieverQueryEngine]:
     all_nodes = list(index.docstore.docs.values())
-    filtered = [n for n in all_nodes if n.metadata.get("doc_type") == doc_type]
-    if not filtered:
-        return None
-    return _make_engine(index, filtered, doc_type=doc_type)
+    filtered  = [n for n in all_nodes if n.metadata.get("doc_type") == doc_type]
+    return _make_engine(index, filtered, doc_type_filter=doc_type) if filtered else None
 
-# --- Query Routing ------------------------------------------------------------
 
-def predict_query_doc_type(query: str) -> str:
-    available = list({m["doc_type"] for m in pdf_metadata_store})
+# =============================================================================
+# 12. QUERY ROUTING
+# =============================================================================
+
+def fast_route_by_keywords(query: str) -> Optional[str]:
+    """Map query terms to a loaded doc_type — no LLM. Returns None if no match."""
+    available = {m["doc_type"] for m in pdf_metadata_store}
     if not available:
-        return "Other"
-    safe_query = sanitize_text(query, max_chars=300)
-    prompt = (
-        "You are a document router. Given the query below, pick the single most "
-        "relevant document category from the available list.\n\n"
-        f"Query: {safe_query}\n\n"
-        f"Available categories: {', '.join(available)}\n\n"
-        "Reply with one category name only — no explanation, no punctuation, no code.\n"
-        "Answer:"
-    )
-    response = _gemini_complete(prompt)
-    for known in sorted(_DOC_TYPES, key=len, reverse=True):
-        if known.lower() in response.lower():
-            return known
-    return "Other"
+        return None
+    if len(available) == 1:
+        return next(iter(available))
+
+    lower = query.lower()
+    for doc_type, keywords in _QUERY_ROUTING_RULES:
+        if doc_type not in available:
+            continue
+        if any(kw in lower for kw in keywords):
+            return doc_type
+    return None
+
+
+def resolve_query_doc_type(query: str) -> Optional[str]:
+    """Optional pre-filter; None means search the full index (default)."""
+    if not QUERY_DOC_TYPE_ROUTING:
+        return None
+    return fast_route_by_keywords(query)
+
 
 def retrieve_files_by_doc_type(doc_type: str) -> list:
     return [m for m in pdf_metadata_store if m["doc_type"] == doc_type]
 
-# --- Main ---------------------------------------------------------------------
+
+# =============================================================================
+# 13. CLI ENTRY POINT
+# =============================================================================
 
 def main():
-    print("\n=== Document Q&A ===\n")
-    pdf_path = input("Enter path to PDF file: ").strip().strip('"')
-    try:
-        validate_pdf_path(pdf_path)
-    except ValueError as e:
-        print(e)
+    pdf_path = input("PDF path: ").strip().strip('"')
+    if not os.path.isfile(pdf_path):
+        print(f"File not found: {pdf_path}")
         return
 
-    from datetime import datetime
-    start = datetime.now()
-    documents = load_pdf(pdf_path)
-    index     = build_index(documents)
-    engine    = build_rag_pipeline(index)
-    elapsed   = f"{(datetime.now() - start).total_seconds():.1f}s"
+    print(f"\nLoading {os.path.basename(pdf_path)}…")
+    docs   = load_pdf(pdf_path)
+    index  = build_index(docs)
+    engine = build_rag_pipeline(index)
 
-    doc_types = list({m["doc_type"] for m in pdf_metadata_store})
-    print(f"\nProcessed: {os.path.basename(pdf_path)}")
-    print(f"  Pages:   {len(pdf_metadata_store)}")
-    print(f"  Types:   {', '.join(doc_types)}")
-    print(f"  Time:    {elapsed}")
-    print('\nReady. Type your question or "exit" to quit.\n')
+    types = sorted({m["doc_type"] for m in pdf_metadata_store})
+    print(f"Types detected: {', '.join(types)}")
+    print('Ready — type your question or "exit" to quit.\n')
 
     while True:
-        question = input("You: ").strip()
-        if not question:
+        query = input("You: ").strip()
+        if not query:
             continue
-        if question.lower() in ("exit", "quit"):
-            print("Goodbye!")
+        if query.lower() in ("exit", "quit"):
             break
-        try:
-            question = validate_query(question)
-        except ValueError as e:
-            print(f"  {e}")
-            continue
 
-        predicted_type = predict_query_doc_type(question)
-        matched        = retrieve_files_by_doc_type(predicted_type)
-        q_engine       = build_filtered_engine(index, predicted_type) if matched else engine
+        predicted = resolve_query_doc_type(query)
+        matched   = retrieve_files_by_doc_type(predicted) if predicted else []
+        q_engine  = build_filtered_engine(index, predicted) if matched else engine
+        if QUERY_DOC_TYPE_ROUTING and predicted:
+            print(f"  Routing to: {predicted} ({len(matched)} page(s))")
+        else:
+            print("  Searching full document index")
 
-        response = q_engine.query(question)
+        response = q_engine.query(query)
         print(f"\n{response}\n")
         for node in response.source_nodes:
             m = node.metadata
