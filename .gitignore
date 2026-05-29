@@ -21,6 +21,7 @@ env/
 
 # LlamaIndex / model caches
 storage/
+.gradio/
 
 # Phase 2 local data (blobs + sqlite metadata)
 data/

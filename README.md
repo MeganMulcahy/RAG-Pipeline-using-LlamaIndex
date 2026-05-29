@@ -72,11 +72,16 @@ Upload a document and ask plain-English questions. The system extracts text, ind
      TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
      ```
 
-4. Run:
+4. Run (CLI):
    ```bash
    python rag_pipeline.py
    ```
-   Enter a file path when prompted, then ask questions. Type `exit` to quit.
+   Enter a file path when prompted (or press Enter to load Chroma), then ask questions.
+
+   Or run the **Streamlit UI**:
+   ```bash
+   streamlit run app.py
+   ```
 
 ### Inspect ingest output (PDF sample pages)
 

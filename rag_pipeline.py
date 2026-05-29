@@ -36,9 +36,11 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import BaseRetriever
-from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
+
+from persist import PersistStore
 
 load_dotenv(override=True)
 
@@ -649,7 +651,13 @@ def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
 page_manifest: List[str] = []   # populated by load_pdf; compact per-page metadata
 
 
-def load_pdf(pdf_path) -> List[Document]:
+def load_pdf(
+    pdf_path,
+    *,
+    file_hash: str = "",
+    blob_id: str = "",
+    version_num: int = 1,
+) -> List[Document]:
     """
     Full ingestion pipeline for one PDF:
       blob_reader → heuristic boundaries → group → Documents
@@ -662,7 +670,7 @@ def load_pdf(pdf_path) -> List[Document]:
         os.path.basename(pdf_path.name) if hasattr(pdf_path, "name")
         else os.path.basename(str(pdf_path))
     )
-    file_id     = str(uuid.uuid4())
+    file_id     = blob_id or str(uuid.uuid4())
     total_pages = len(pages)
     non_empty   = [(i, p) for i, p in enumerate(pages) if p.text.strip()]
 
@@ -696,12 +704,18 @@ def load_pdf(pdf_path) -> List[Document]:
     logical_docs = group_logical_docs(pages)
     print(f"\n  {len(logical_docs)} logical document(s) identified.")
 
+    base = {
+        "file_id":     file_id,
+        "file_name":   file_name,
+        "file_hash":   file_hash,
+        "blob_id":     blob_id,
+        "version_num": version_num,
+    }
     return [
         Document(
             text     = doc.text,
             metadata = {
-                "file_id":    file_id,
-                "file_name":  file_name,
+                **base,
                 "doc_id":     doc.doc_id,
                 "page_start": doc.page_start,
                 "page_end":   doc.page_end,
@@ -719,7 +733,13 @@ def load_pdfs(paths: List[str]) -> List[Document]:
     return all_docs
 
 
-def _load_unstructured_file(path: Path) -> List[Document]:
+def _load_unstructured_file(
+    path: Path,
+    *,
+    file_hash: str = "",
+    blob_id: str = "",
+    version_num: int = 1,
+) -> List[Document]:
     """Extract text from non-PDF files (Word, Excel, slides, HTML, images, txt, …)."""
     global page_manifest
     page_manifest = []
@@ -733,11 +753,14 @@ def _load_unstructured_file(path: Path) -> List[Document]:
     if not text.strip():
         raise ValueError(f"No text extracted from {path.name}")
 
-    file_id = str(uuid.uuid4())
+    file_id = blob_id or str(uuid.uuid4())
     page_manifest.append(f"0|0|{file_id}|{path.name}|unstructured")
     metadata = {
         "file_id":      file_id,
         "file_name":    path.name,
+        "file_hash":    file_hash,
+        "blob_id":      blob_id,
+        "version_num":  version_num,
         "doc_id":       "doc_0",
         "page_start":   0,
         "page_end":     0,
@@ -750,17 +773,24 @@ def _load_unstructured_file(path: Path) -> List[Document]:
     return [Document(text=text, metadata=metadata)]
 
 
-def load_file(file_path) -> List[Document]:
+def load_file(
+    file_path,
+    *,
+    file_hash: str = "",
+    blob_id: str = "",
+    version_num: int = 1,
+) -> List[Document]:
     """
     Ingest one file. PDFs use the two-pass page pipeline; other types use
     unstructured (partition.auto) — docx, xlsx, pptx, html, images, txt, etc.
     """
     path = Path(file_path)
+    kw = {"file_hash": file_hash, "blob_id": blob_id, "version_num": version_num}
     if path.suffix.lower() == PDF_EXTENSION:
-        return load_pdf(file_path)
+        return load_pdf(file_path, **kw)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
-    return _load_unstructured_file(path)
+    return _load_unstructured_file(path, **kw)
 
 
 # =============================================================================
@@ -836,12 +866,16 @@ def dedupe_source_nodes(nodes: list) -> list:
 # 10. INDEXING
 # =============================================================================
 
-def build_index(documents: List[Document]) -> VectorStoreIndex:
+def documents_to_nodes(documents: List[Document]) -> List[TextNode]:
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     nodes = splitter.get_nodes_from_documents(documents)
     nodes = dedupe_nodes(nodes)
-    logging.info("Indexing %d unique chunk(s) after deduplication", len(nodes))
-    return VectorStoreIndex(nodes=nodes)
+    logging.info("Chunking: %d unique node(s) after deduplication", len(nodes))
+    return nodes
+
+
+def build_index(documents: List[Document]) -> VectorStoreIndex:
+    return VectorStoreIndex(nodes=documents_to_nodes(documents))
 
 
 # =============================================================================
@@ -903,8 +937,12 @@ def _make_engine(index: VectorStoreIndex, nodes: list) -> RetrieverQueryEngine:
     )
 
 
-def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
-    nodes = list(index.docstore.docs.values())
+def build_rag_pipeline(
+    index: VectorStoreIndex,
+    nodes: Optional[List[TextNode]] = None,
+) -> RetrieverQueryEngine:
+    if nodes is None:
+        nodes = list(index.docstore.docs.values())
     return _make_engine(index, nodes)
 
 
@@ -912,12 +950,44 @@ def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
 # 13. INGEST
 # =============================================================================
 
-def ingest_file(file_path: str) -> Tuple[VectorStoreIndex, RetrieverQueryEngine]:
-    """Load any supported file, chunk, embed, and build the query engine."""
-    docs = load_file(file_path)
-    index = build_index(docs)
-    engine = build_rag_pipeline(index)
-    return index, engine
+def ingest_file(
+    file_path: str,
+    store: Optional[PersistStore] = None,
+) -> Tuple[VectorStoreIndex, RetrieverQueryEngine, str]:
+    """Ingest into Chroma; skip extract/embed if file_hash already indexed."""
+    store = store or PersistStore()
+    path = Path(file_path)
+    file_bytes = path.read_bytes()
+    file_hash, blob_id = store.save_blob(file_bytes, path.name)
+
+    if store.is_ingested(file_hash):
+        print(f"\n  Already indexed (hash {blob_id}) — loading Chroma…")
+        index, nodes = store.load_index()
+        return index, build_rag_pipeline(index, nodes), file_hash
+
+    version_num = store.get_or_assign_version(path.name, file_hash)
+    print(f"\n  New ingest: {path.name} v{version_num} (blob {blob_id})")
+
+    docs = load_file(
+        file_path,
+        file_hash=file_hash,
+        blob_id=blob_id,
+        version_num=version_num,
+    )
+    nodes = documents_to_nodes(docs)
+    index, nodes = store.build_index(nodes)
+    store.mark_ingested(file_hash, path.name, blob_id, version_num, len(nodes))
+    return index, build_rag_pipeline(index, nodes), file_hash
+
+
+def load_persistent_index(
+    store: Optional[PersistStore] = None,
+) -> Tuple[VectorStoreIndex, RetrieverQueryEngine]:
+    store = store or PersistStore()
+    if not store.has_index():
+        raise FileNotFoundError("No saved index in Chroma. Ingest a file first.")
+    index, nodes = store.load_index()
+    return index, build_rag_pipeline(index, nodes)
 
 
 # =============================================================================
@@ -925,18 +995,38 @@ def ingest_file(file_path: str) -> Tuple[VectorStoreIndex, RetrieverQueryEngine]
 # =============================================================================
 
 def main():
+    store = PersistStore()
     file_path = input(
-        "File path (PDF, Word, Excel, slides, HTML, txt, images, …): "
+        "File path (Enter = load saved Chroma index): "
     ).strip().strip('"')
-    if not os.path.isfile(file_path):
-        print(f"File not found: {file_path}")
+
+    try:
+        if file_path and os.path.isfile(file_path):
+            print(f"\nLoading {os.path.basename(file_path)}…")
+            _, engine, file_hash = ingest_file(file_path, store)
+            print(
+                f"Ready — hash {file_hash[:16]}…  "
+                f"({store.chunk_count()} chunk(s) in Chroma)"
+            )
+        elif store.has_index():
+            print("\nLoading saved index from Chroma…")
+            engine = load_persistent_index(store)[1]
+            print(f"Loaded {store.chunk_count()} chunk(s) from disk.")
+        else:
+            print("No file path and no saved index. Provide a file to ingest.")
+            return
+    except FileNotFoundError as e:
+        print(e)
         return
 
-    print(f"\nLoading {os.path.basename(file_path)}…")
-    _, engine = ingest_file(file_path)
-    seg = "page(s)" if Path(file_path).suffix.lower() == PDF_EXTENSION else "segment(s)"
-    print(f"Ingested {len(page_manifest)} {seg}.")
-    print('Ready — type your question or "exit" to quit.\n')
+    if page_manifest:
+        seg = (
+            "page(s)"
+            if file_path and Path(file_path).suffix.lower() == PDF_EXTENSION
+            else "segment(s)"
+        )
+        print(f"Last run: {len(page_manifest)} {seg} in manifest.")
+    print('Ask questions — type "exit" to quit.\n')
 
     while True:
         query = input("You: ").strip()
@@ -952,7 +1042,7 @@ def main():
             m = node.metadata
             print(
                 f"  [p.{m.get('page_start')}-{m.get('page_end')}  "
-                f"{m.get('file_name')}  {m.get('doc_id')}]"
+                f"{m.get('file_name')} v{m.get('version_num')}  {m.get('doc_id')}]"
             )
         print("-" * 60)
 

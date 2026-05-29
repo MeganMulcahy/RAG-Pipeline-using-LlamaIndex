@@ -14,7 +14,9 @@ REQUIRED_PACKAGES = [
     "pytesseract",
     "pillow",
     "llama-index-readers-file",
-    "gradio",
+    "streamlit",
+    "chromadb",
+    "llama-index-vector-stores-chroma",
 ]
 
 
