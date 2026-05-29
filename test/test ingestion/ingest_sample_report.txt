@@ -1,0 +1,674 @@
+
+PDF: test blob file2.pdf
+Pass 1: classifying all pages (fitz only)…
+
+Page counts by content_type:
+  image_dominant: 3
+  native_text: 33
+  table_heavy: 13
+
+Pass 2: extracting 7 sample page(s)…
+
+========================================================================
+TEXT (native)  |  PDF page 3 (0-based index 2)
+========================================================================
+  content_type:    native_text
+  fitz char_count: 2071
+  extractor:       pymupdf4llm
+  extracted chars: 2432
+
+--- fitz raw text ---
+Additional Information About This Loan
+LENDER
+NMLS / ___ LICENSE ID
+LOAN OFFICER
+NMLS / ___ LICENSE ID
+EMAIL
+PHONE
+MORTGAGE BROKER
+NMLS / ___ LICENSE ID
+LOAN OFFICER
+NMLS / ___ LICENSE ID
+EMAIL
+PHONE
+Comparisons
+Use these measures to compare this loan with other loans.
+In 5 Years
+Annual Percentage Rate (APR)
+Total Interest Percentage (TIP)
+Total you will have paid in principal, interest, mortgage insurance, and loan costs.
+Principal you will have paid off.
+Your costs over the loan term expressed as a rate. This is not your interest rate.
+The total amount of interest that you will pay over the loan term as a
+percentage of your loan amount.
+Other Considerations
+Appraisal
+Assumption
+Homeowner’s
+Insurance
+Late Payment
+Refinance
+Servicing
+We may order an appraisal to determine the property’s value and charge you for this
+appraisal. We will promptly give you a copy of any appraisal, even if your loan does not close.
+You can pay for an additional appraisal for your own use at your own cost.
+If you sell or transfer this property to another person, we
+will allow, under certain conditions,  this person to assume this loan on the original terms.
+will not allow assumption of this loan on the original terms.
+This loan requires homeowner’s insurance on the property, which you may obtain from a
+company of your choice that we find acceptable.
+If your payment is more than
+days late, we will charge a late fee of
+Refinancing this loan will depend on your future financial situation, the property value, and
+market conditions. You may not be able to refinance this loan.
+We intend 
+to service your loan. If so, you will make your payments to us.
+to transfer servicing of your loan.
+Confirm Receipt
+By signing, you are only confirming that you have received this form. You do not have to accept this loan because you have signed or
+received this form.
+Applicant Signature
+Date
+Co-Applicant Signature
+Date
+LOAN ESTIMATE
+Calyx Form - LE3_conf.frm (02/2015)
+PAGE 3 OF 3  •  LOAN ID #  
+# D
+XYZ Lender
+CA
+XYZ Lender
+CA
+$117,339
+$34,931
+4.329%
+77.39%
+15
+6% of the payment.
+
+--- extracted text used for RAG ---
+## **Additional Information About This Loan** 
+
+> **LENDER** XYZ Lender **MORTGAGE BROKER** XYZ Lender **NMLS / CA___ LICENSE ID NMLS / ___ LICENSE IDCA LOAN OFFICER LOAN OFFICER NMLS / ___ LICENSE ID NMLS / ___ LICENSE ID EMAIL EMAIL PHONE PHONE** 
+
+**Comparisons Use these measures to compare this loan with other loans.** $117,339 Total you will have paid in principal, interest, mortgage insurance, and loan costs. **In 5 Years** $34,931 Principal you will have paid off. **Annual Percentage Rate (APR)** 4.329% Your costs over the loan term expressed as a rate. This is not your interest rate. The total amount of interest that you will pay over the loan term as a **Total Interest Percentage (TIP)** 77.39% percentage of your loan amount. 
+
+**==> picture [154 x 17] intentionally omitted <==**
+
+**----- Start of picture text -----**<br>
+Other Considerations<br>**----- End of picture text -----**<br>
+
+
+**Appraisal** We may order an appraisal to determine the property’s value and charge you for this appraisal. We will promptly give you a copy of any appraisal, even if your loan does not close. You can pay for an additional appraisal for your own use at your own cost. **Assumption** If you sell or transfer this property to another person, we will allow, under certain conditions,  this person to assume this loan on the original terms. will not allow assumption of this loan on the original terms. **Homeowner’s** This loan requires homeowner’s insurance on the property, which you may obtain from a **Insurance** company of your choice that we find acceptable. **Late Payment** If your payment is more than _15_ days late, we will charge a late fee of _6% of the payment._ **Refinance** Refinancing this loan will depend on your future financial situation, the property value, and market conditions. You may not be able to refinance this loan. **Servicing** We intend to service your loan. If so, you will make your payments to us. to transfer servicing of your loan. 
+
+**==> picture [154 x 17] intentionally omitted <==**
+
+**----- Start of picture text -----**<br>
+Confirm Receipt<br>**----- End of picture text -----**<br>
+
+
+By signing, you are only confirming that you have received this form. You do not have to accept this loan because you have signed or received this form. 
+
+Applicant Signature 
+
+Date 
+
+Co-Applicant Signature 
+
+Date 
+
+LOAN ESTIMATE Calyx Form - LE3_conf.frm (02/2015) 
+
+PAGE 3 OF 3  •  LOAN ID #
+
+========================================================================
+TABLE (table_heavy)  |  PDF page 1 (0-based index 0)
+========================================================================
+  content_type:    table_heavy
+  fitz char_count: 1769
+  extractor:       pymupdf4llm
+  extracted chars: 3729
+
+--- fitz raw text ---
+Loan Estimate
+Save this Loan Estimate to compare with your Closing Disclosure.
+DATE ISSUED
+APPLICANTS
+PROPERTY
+SALE PRICE
+LOAN TERM
+PURPOSE
+PRODUCT
+LOAN TYPE
+LOAN ID #
+RATE LOCK
+Conventional
+FHA
+VA
+NO
+YES, until
+Before closing, your interest rate, points, and lender credits can
+change unless you lock the interest rate. All other estimated
+closing costs expire on
+Loan Terms
+Can this amount increase after closing?
+Does the loan have these features?
+Loan Amount
+Interest Rate
+Monthly Principal & Interest
+Prepayment Penalty
+Balloon Payment
+See Projected Payments below for your
+Estimated Total Monthly Payment
+Projected Payments
+Payment Calculation
+Principal & Interest
+Mortgage Insurance
+Estimated Escrow
+Amount can increase over time
+Estimated Total
+Monthly Payment
+Estimated Taxes, Insurance
+& Assessments
+Amount can increase over time
+This estimate includes
+In escrow?
+Property Taxes
+Homeowner’s Insurance
+Other:
+See Section G on page 2 for escrowed property costs. You must pay for other
+property costs separately.
+Costs at Closing
+Estimated Closing Costs
+Estimated Cash to Close
+Includes                    in Loan Costs +                   
+in Other Costs -
+in Lender Credits.
+Includes Closing Costs.
+See page 2 for details.
+See Calculating Cash to Close on page 2 for details.
+Visit
+for general information and tools.
+www.consumerfinance.gov/mortgage-estimate
+LOAN ESTIMATE
+Calyx Form - LE1_1col.frm (02/2015)
+PAGE 1 OF 3  •  LOAN ID #  
+# D
+XYZ Lender
+• ,
+10/05/2015
+John Q. Smith
+Mary A. Smith
+1234 Market St.
+San Diego,  CA 9210x
+1254 Main Street
+San Diego, CA 92110
+$475,000
+30 years
+Purchase
+Fixed Rate
+01/20/2015
+11/20/2015
+$380,000
+4.25%
+$1,869.37
+NO
+NO
+NO
+NO
+NO
+Years 1-30
+$1,869.37
++
+0
++
+0
+$1,869.37
+$440
+a month
+NO
+NO
+$5,802
+$95,802
+$4,055
+$1,747
+$0
+
+--- extracted text used for RAG ---
+• , 
+
+## XYZ Lender 
+
+_Save this Loan Estimate to compare with your Closing Disclosure._ 
+
+|**Loan Estimate**<br>**DATE ISSUED**<br>**APPLICANTS**<br>**PROPERTY**<br>**SALE PRICE**<br>**LOAN TERM**<br>**PURPOSE**<br>**PRODUCT**<br>**LOAN TYPE**<br>**LOAN ID #**<br>**RATE LOCK**<br>Conventional<br>FHA<br>VA<br>NO<br>YES, until<br>_Before closing, your interest rate, points, and lender credits can_<br>_change unless you lock the interest rate. All other estimated_<br>_closing costs expire on_<br>**Loan Terms**<br>**Can this amount increase after closing?**<br>10/05/2015<br>John Q. Smith<br>Mary A. Smith<br>1234 Market St.<br>San Diego,  CA 9210x<br>1254 Main Street<br>San Diego, CA 92110<br>$475,000<br>30 years<br>Purchase<br>Fixed Rate<br>01/20/2015<br>**11/20/2015**|**Loan Estimate**<br>**DATE ISSUED**<br>**APPLICANTS**<br>**PROPERTY**<br>**SALE PRICE**<br>**LOAN TERM**<br>**PURPOSE**<br>**PRODUCT**<br>**LOAN TYPE**<br>**LOAN ID #**<br>**RATE LOCK**<br>Conventional<br>FHA<br>VA<br>NO<br>YES, until<br>_Before closing, your interest rate, points, and lender credits can_<br>_change unless you lock the interest rate. All other estimated_<br>_closing costs expire on_<br>**Loan Terms**<br>**Can this amount increase after closing?**<br>10/05/2015<br>John Q. Smith<br>Mary A. Smith<br>1234 Market St.<br>San Diego,  CA 9210x<br>1254 Main Street<br>San Diego, CA 92110<br>$475,000<br>30 years<br>Purchase<br>Fixed Rate<br>01/20/2015<br>**11/20/2015**|**Loan Estimate**<br>**DATE ISSUED**<br>**APPLICANTS**<br>**PROPERTY**<br>**SALE PRICE**<br>**LOAN TERM**<br>**PURPOSE**<br>**PRODUCT**<br>**LOAN TYPE**<br>**LOAN ID #**<br>**RATE LOCK**<br>Conventional<br>FHA<br>VA<br>NO<br>YES, until<br>_Before closing, your interest rate, points, and lender credits can_<br>_change unless you lock the interest rate. All other estimated_<br>_closing costs expire on_<br>**Loan Terms**<br>**Can this amount increase after closing?**<br>10/05/2015<br>John Q. Smith<br>Mary A. Smith<br>1234 Market St.<br>San Diego,  CA 9210x<br>1254 Main Street<br>San Diego, CA 92110<br>$475,000<br>30 years<br>Purchase<br>Fixed Rate<br>01/20/2015<br>**11/20/2015**||
+|---|---|---|---|
+|||||
+|**Loan Amount**|$380,000<br>**NO**|||
+|**Interest Rate**|4.25%<br>**NO**|||
+|**Monthly Principal & Interest**<br>_See Projected Payments below for your_<br>_Estimated Total Monthly Payment_|$1,869.37<br>**NO**|||
+|**Prepayment Penalty**|**Does the loan have these features?**<br>**NO**|||
+|**Balloon Payment**|**NO**|||
+
+
+
+**==> picture [154 x 17] intentionally omitted <==**
+
+**----- Start of picture text -----**<br>
+Projected Payments<br>**----- End of picture text -----**<br>
+
+
+|**Payment Calculation**|**Years 1-30**|
+|---|---|
+|Principal & Interest<br>Mortgage Insurance<br>Estimated Escrow<br>_Amount can increase over time_|$1,869.37<br>+<br>0<br>+<br>0|
+|**Estimated Total**<br>**Monthly Payment**|$1,869.37|
+|**Estimated Taxes, Insurance**<br>**& Assessments**<br>_Amount can increase over time_|**This estimate includes**<br>**In escrow?**<br>Property Taxes<br>Homeowner’s Insurance<br>Other:<br>_See Section G on page 2 for escrowed property costs. You must pay for other_<br>_property costs separately._<br>$440<br>a month<br>**NO**<br>**NO**|
+|**Costs at Closing**||
+|**Estimated Closing Costs**|Includes                    in Loan Costs +<br>in Other Costs -<br>in Lender Credits.<br>_See page 2 for details._<br>$5,802<br>$4,055<br>$1,747<br>$0|
+|**Estimated Cash to Close**|Includes Closing Costs.<br>_See Calculating Cash to Close on page 2 for details._<br>$95,802|
+
+
+
+Visit **www.consumerfinance.gov/mortgage-estimate** for general information and tools. 
+
+LOAN ESTIMATE Calyx Form - LE1_1col.frm (02/2015) 
+
+PAGE 1 OF 3  •  LOAN ID #
+
+========================================================================
+TABLE (table_heavy)  |  PDF page 2 (0-based index 1)
+========================================================================
+  content_type:    table_heavy
+  fitz char_count: 1493
+  extractor:       pymupdf4llm
+  extracted chars: 2171
+
+--- fitz raw text ---
+Closing Cost Details
+Loan Costs
+A. Origination Charges
+B.  Services You Cannot Shop For
+C.  Services You Can Shop For
+D.  TOTAL LOAN COSTS (A + B + C)
+Other Costs
+E.  Taxes and Other Government Fees 
+Recording Fees and Other Taxes
+Transfer Taxes
+F.  Prepaids
+Homeowner’s Insurance Premium (
+months)
+Mortgage Insurance Premium (
+months)
+Prepaid Interest (
+per day for
+days @
+%)
+Property Taxes (
+months)
+G.  Initial Escrow Payment at Closing
+Homeowner’s Insurance
+per month for
+mo.
+Mortgage Insurance
+per month for
+mo.
+Property Taxes
+per month for
+mo.
+H.  Other
+I.  TOTAL OTHER COSTS (E + F + G + H) 
+J.  TOTAL CLOSING COSTS
+D + I
+Lender Credits
+Calculating Cash to Close
+Total Closing Costs (J)
+Closing Costs Financed (Paid from your Loan Amount)
+Down Payment/Funds from Borrower
+Deposit
+Funds for Borrower
+Seller Credits
+Adjustments and Other Credits
+Estimated Cash to Close
+LOAN ESTIMATE
+Calyx Form - LE2_fixed.frm (02/2015)
+PAGE 2 OF 3  •  LOAN ID #  
+# D
+$1,070
+% of Loan Amount (Points)
+Administration Fee
+Underwriting Fee
+Wire Transfer Fee
+$445
+$550
+$75
+$650
+Appraisal Fee
+Credit Report
+Flood Certification
+Tax Service Fee
+$525
+$25
+$20
+$80
+$2,335
+Electronic Document Delivery Fee
+Home Inspection
+Pest Inspection
+Title - Closing/Escrow Fee
+Title - Courier Fee
+Title - Doc Prep Fees
+Title - Lender's Title Insurance
+Title - Notary Fees
+$50
+$450
+$50
+$860
+$50
+$75
+$650
+$150
+$4,055
+$150
+$150
+$1,597
+12
+$44.86
+25
+4.25
+$475
+$1,122
+$1,747
+$5,802
+$5,802
+$5,802
+$0
+$95,000
+-$5,000
+$0
+$0
+$0
+$95,802
+
+--- extracted text used for RAG ---
+## **Closing Cost Details** 
+
+**==> picture [138 x 17] intentionally omitted <==**
+
+**----- Start of picture text -----**<br>
+Loan Costs<br>**----- End of picture text -----**<br>
+
+
+|**A. Origination Charges**|**$1,070**|
+|---|---|
+|% of Loan Amount (Points)||
+|Administration Fee|$445|
+|Underwriting Fee|$550|
+|Wire Transfer Fee|$75|
+
+
+
+|**B.  Services You Cannot Shop For**|**$650**|
+|---|---|
+|Appraisal Fee|$525|
+|Credit Report|$25|
+|Flood Certification|$20|
+|Tax Service Fee|$80|
+
+
+
+**==> picture [138 x 17] intentionally omitted <==**
+
+**----- Start of picture text -----**<br>
+Other Costs<br>**----- End of picture text -----**<br>
+
+
+|**E.  Taxes and Other Government Fees**|**E.  Taxes and Other Government Fees**||||**$150**|
+|---|---|---|---|---|---|
+|Recording Fees and Other Taxes|||||$150|
+|Transfer Taxes||||||
+|**F.  Prepaids**|||||**$1,597**|
+|Homeowner’s Insurance Premium (|12|months)|||$475|
+|Mortgage Insurance Premium (|months)|||||
+|Prepaid Interest (<br>per day for<br>$44.86<br>25||days @|4.25|%)|$1,122|
+|Property Taxes (<br>months)||||||
+
+
+
+|**G.  Initial Escrow Payment at Closing**|**G.  Initial Escrow Payment at Closing**||
+|---|---|---|
+|Homeowner’s Insurance|per month for|mo.|
+|Mortgage Insurance|per month for|mo.|
+|Property Taxes|per month for|mo.|
+
+
+
+## **H.  Other** 
+
+|**C.  Services You Can Shop For**|**$2,335**|
+|---|---|
+|Electronic Document Delivery Fee|$50|
+|Home Inspection|$450|
+|Pest Inspection|$50|
+|Title - Closing/Escrow Fee|$860|
+|Title - Courier Fee|$50|
+|Title - Doc Prep Fees|$75|
+|Title - Lender's Title Insurance|$650|
+|Title - Notary Fees|$150|
+
+
+
+**D.  TOTAL LOAN COSTS (A + B + C) $4,055** 
+
+|**I.  TOTAL OTHER COSTS (E + F + G + H)**|**$1,747**|
+|---|---|
+|**J.  TOTAL CLOSING COSTS**|**$5,802**|
+|D + I|$5,802|
+|Lender Credits||
+|**Calculating Cash to Close**||
+|Total ClosingCosts(J)|$5,802|
+|ClosingCosts Financed(Paid fromyour Loan Amount)|$0|
+|Down Payment/Funds from Borrower|$95,000|
+|Deposit|-$5,000|
+|Funds for Borrower|$0|
+|Seller Credits|$0|
+|Adjustments and Other Credits|$0|
+|**Estimated Cash to Close**|**$95,802**|
+
+
+
+LOAN ESTIMATE Calyx Form - LE2_fixed.frm (02/2015) 
+
+PAGE 2 OF 3  •  LOAN ID #
+
+========================================================================
+TABLE (table_heavy)  |  PDF page 16 (0-based index 15)
+========================================================================
+  content_type:    table_heavy
+  fitz char_count: 1420
+  extractor:       pymupdf4llm
+  extracted chars: 1566
+
+--- fitz raw text ---
+Request for $20.00 Discount – CA Settlement
+Use one form for each qualifying property.
+To:
+Ticor Title Company of California, 2878 Camino Del Rio South, Suite 500, San Diego, CA 92108
+Date:
+From:
+(name)
+Current Address:
+I believe that I am qualified for the $20.00 discount pursuant to the coordinated stipulated judgments 
+entered in actions filed by both the Attorney General and private class action plaintiffs. I have not 
+previously received a cash payment or a discount from another Company on the property described 
+below:
+Signed:
+Date:
+Address of 
+qualifying 
+property:
+Approximate date 
+of transaction
+THIS SECTION IS FOR COMPANY USE ONLY.
+
+The above referenced party is entitled to receive a $20.00 discount on escrow services or title insurance 
+pursuant to the coordinated stipulated judgments entered in actions filed by both the Attorney General and 
+private class action plaintiffs.
+OR
+
+The above referenced party does NOT qualify for the $20.00 discount pursuant to the coordinated 
+stipulated judgments entered in actions filed by both the Attorney General and private class action 
+plaintiffs for the following reason:
+
+The party has previously received credit for the transaction described above.
+
+The transaction described above did not occur in the time period allowed by the stipulated 
+judgments—May 19, 1995 to November 1, 2002.
+Fax this response to:
+Escrow No.:
+Escrow Officer:
+Fax Number:
+
+--- extracted text used for RAG ---
+## **Request for $20.00 Discount – CA Settlement** 
+
+_Use one form for each qualifying property._ 
+
+||_Use one form for each qualifying property._|
+|---|---|
+|To:|Ticor Title Company of California, 2878 Camino Del Rio South, Suite 500, San Diego, CA 92108|
+|Date:||
+|From:<br>(name)||
+|Current Address:||
+||I believe that I am qualified for the $20.00 discount pursuant to the coordinated stipulated judgments<br>entered in actions filed by both the Attorney General and private class action plaintiffs. I have not<br>previously received a cash payment or a discount from another Company on the property described<br>below:<br>Signed:<br>Date:|
+|Address of<br>qualifying<br>property:||
+|Approximate date<br>of transaction||
+
+
+
+## **THIS SECTION IS FOR COMPANY USE ONLY.** 
+
+ The above referenced party is entitled to receive a $20.00 discount on escrow services or title insurance pursuant to the coordinated stipulated judgments entered in actions filed by both the Attorney General and private class action plaintiffs. 
+
+## **OR** 
+
+- The above referenced party does NOT qualify for the $20.00 discount pursuant to the coordinated stipulated judgments entered in actions filed by both the Attorney General and private class action plaintiffs for the following reason:  The party has previously received credit for the transaction described above.  The transaction described above did not occur in the time period allowed by the stipulated judgments—May 19, 1995 to November 1, 2002. 
+
+- **Escrow No.: Escrow Officer: Fax Number:** 
+
+## **Fax this response to:**
+
+========================================================================
+HARD / SCANNED (image_dominant)  |  PDF page 36 (0-based index 35)
+========================================================================
+  content_type:    image_dominant
+  fitz char_count: 0
+  extractor:       pytesseract
+  extracted chars: 538
+
+--- extracted text used for RAG ---
+Payslip
+
+Zoonodle Ine
+21023 Pearson Point Road
+Gateway Avenue
+Date of Joining 2018-06-23 Employee name Sally Harley
+Pay Period :August 2021 Designation : Marketing Executive
+Worked Days. 126 Department Marketing
+Earnings Amount Deductions Amount
+Basic 10000 | Provident Fund 1200
+Incentive Pay 1000 | Profesional Tax 500
+House Rent Allowance 400] Loan 400
+Meal Allowance 200)
+Total Earnings 11600 Total Deductions 2100
+Net Pay ‘9500
+9500
+Nine Thousand Five Hundred
+Employer Signature Employee Signature
+
+This is system generated payslip
+
+========================================================================
+HARD / SCANNED (image_dominant)  |  PDF page 37 (0-based index 36)
+========================================================================
+  content_type:    image_dominant
+  fitz char_count: 0
+  extractor:       pytesseract
+  extracted chars: 145
+
+--- extracted text used for RAG ---
+DRIVER'S
+
+is f Le E
+
+=. SAMPLI
+'2 CARON ELIZABETH
+8 ae NORTH: STREET —
+
+TOrEKA, KS 66612-1234
+
+4401
+teres igh
+
+5 DD Xx123xWNDO
+‘23XWMX123XWM12_
+
+========================================================================
+HARD / SCANNED (image_dominant)  |  PDF page 38 (0-based index 37)
+========================================================================
+  content_type:    image_dominant
+  fitz char_count: 0
+  extractor:       pytesseract
+  extracted chars: 659
+
+--- extracted text used for RAG ---
+€, a7
+
+Zylker Electronics Hub
+1M, North Strat
+
+Greater South Avenue
+
+New York New York 10001
+
+usa
+
+INVOICE
+
+Invoicor ‘mv.000001
+05 Aug 2028
+Bue on Receipt
+05 Aug 2028
+
+Invoice Date
+Terms
+
+Due Date
+
+BiliTo
+
+Ship To
+
+Ms. Mary D. Dunton
+1324 Hinkle Lake Road
+Needham
+
+02192 Maine
+
+1224 Hinkle Lake Road
+c2192Waine
+
+Late payments mayineur adeitonal charg
+
+1] camera 100 | $800.00 | 80000
+[OSL camera wthadvanced shooting
+capabilties
+2|  Funees Tracker 100 | $122.00 | $2900
+3 | Laptop 100 | $1402.00 | $1109.00
+LUghtwelght laptop witha powertu processor
+‘subtotat | $222700
+Thanks forshopping withs. ‘TaxRate 5.00%
+Total $2,338.35
+Terms & Conditions er $2398.35
+
+========================================================================
+Done.

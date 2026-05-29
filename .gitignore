@@ -21,6 +21,9 @@ env/
 
 # LlamaIndex / model caches
 storage/
+
+# Phase 2 local data (blobs + sqlite metadata)
+data/
 .cache/
 *.faiss
 

@@ -15,6 +15,7 @@ Structure
 10. CLI entry point
 """
 
+import hashlib
 import io
 import logging
 import os
@@ -23,6 +24,7 @@ import shutil
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
@@ -37,6 +39,8 @@ from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
+
+from storage import BlobStore, IngestQueue, MetadataStore
 
 load_dotenv(override=True)
 
@@ -62,6 +66,7 @@ CHUNK_OVERLAP   = 100
 TOP_K           = 4
 MAX_EXTRACT_WORKERS = int(os.getenv("MAX_EXTRACT_WORKERS", "4"))
 TESSERACT_CMD       = os.getenv("TESSERACT_CMD", "")
+QUERY_REWRITE       = os.getenv("QUERY_REWRITE", "true").lower() == "true"
 
 _tesseract_available: Optional[bool] = None
 _tesseract_warned    = False
@@ -501,6 +506,86 @@ def blob_reader(pdf_path) -> List[PageInfo]:
     return pages
 
 
+def classify_pages_only(pdf_path: str) -> Tuple[str, List[PageInfo]]:
+    """Pass 1 only: return (pdf_path, PageInfo list with content_type, no extraction)."""
+    doc = fitz.open(pdf_path)
+    path = str(pdf_path)
+    pages: List[PageInfo] = []
+    try:
+        for i, page in enumerate(doc):
+            char_count = len(page.get_text())
+            pages.append(PageInfo(
+                page_num=i,
+                text="",
+                content_type=_classify_page_content_type(page, char_count),
+                char_count=char_count,
+            ))
+    finally:
+        doc.close()
+    return path, pages
+
+
+def extract_page_content(
+    path: str,
+    doc: fitz.Document,
+    pinfo: PageInfo,
+) -> Dict[str, object]:
+    """
+    Run Pass 2 extraction for a single page. Returns ingest details for inspection.
+    """
+    page = doc[pinfo.page_num]
+    fitz_raw = page.get_text()
+    text, table_html, extractor = "", None, "none"
+
+    use_markdown = (
+        pinfo.content_type == "native_text"
+        or (pinfo.content_type == "table_heavy" and pinfo.char_count >= 50)
+    )
+    if use_markdown:
+        try:
+            batch = _extract_native_text_batch(path, [pinfo.page_num])
+            text = batch.get(pinfo.page_num, "")
+            if text.strip():
+                extractor = "pymupdf4llm"
+        except Exception as e:
+            logging.warning("Page %d pymupdf4llm: %s", pinfo.page_num, e)
+        if not text.strip():
+            text = _fitz_page_text(page)
+            extractor = "fitz_fallback"
+
+    elif pinfo.content_type == "image_dominant":
+        # Same as blob_reader: fitz → Tesseract, no unstructured
+        text = _fitz_page_text(page)
+        extractor = "fitz_fallback" if text.strip() else "none"
+        if not text.strip() and _configure_tesseract():
+            text = _ocr_page_text(page, pinfo.page_num)
+            extractor = "pytesseract" if text.strip() else "none"
+        elif not text.strip():
+            _warn_tesseract_missing()
+
+    elif pinfo.content_type == "table_heavy" and pinfo.char_count < 50:
+        tcmd = _get_tesseract_cmd()
+        args = (path, pinfo.page_num, pinfo.content_type, pinfo.char_count, tcmd)
+        _, text, table_html, extractor = _extract_single_page(args)
+        pinfo_tmp = PageInfo(
+            page_num=pinfo.page_num, text="", content_type=pinfo.content_type,
+            char_count=pinfo.char_count,
+        )
+        _finalize_slow_page(doc, pinfo_tmp, text, table_html, extractor)
+        text = pinfo_tmp.text
+        table_html = pinfo_tmp.table_html
+
+    return {
+        "page_num":       pinfo.page_num,
+        "content_type":   pinfo.content_type,
+        "char_count_fitz": pinfo.char_count,
+        "extractor":      extractor,
+        "text":           text,
+        "table_html":     table_html,
+        "fitz_raw":       fitz_raw,
+    }
+
+
 # =============================================================================
 # 5. BOUNDARY DETECTION
 # =============================================================================
@@ -635,16 +720,88 @@ def load_pdfs(paths: List[str]) -> List[Document]:
 
 
 # =============================================================================
-# 9. INDEXING
+# 9. QUERY REWRITE + DEDUPLICATION
+# =============================================================================
+
+def rewrite_query(query: str) -> str:
+    """Fix typos / normalize vague queries before retrieval (Gemini)."""
+    if not QUERY_REWRITE or not query.strip():
+        return query
+    prompt = (
+        "You fix search queries for document retrieval.\n"
+        "Correct spelling and grammar. Keep the same meaning and intent.\n"
+        "Return ONLY the corrected query — no quotes, no explanation.\n\n"
+        f"Query: {query.strip()}\n\n"
+        "Corrected query:"
+    )
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        fixed = (response.text or "").strip().split("\n")[0].strip().strip('"')
+        if fixed and len(fixed) >= 2 and fixed.lower() != query.strip().lower():
+            print(f"  Query rewrite: {query!r} → {fixed!r}")
+            return fixed
+    except Exception as e:
+        logging.warning("Query rewrite failed: %s", e)
+    return query
+
+
+def _node_dedupe_key(node) -> tuple:
+    m = node.metadata or {}
+    text = (node.get_content() if hasattr(node, "get_content") else "")[:200]
+    return (
+        m.get("file_id"),
+        m.get("file_name"),
+        m.get("doc_id"),
+        m.get("page_start"),
+        m.get("page_end"),
+        text,
+    )
+
+
+def dedupe_nodes(nodes: list) -> list:
+    """Drop duplicate chunks (same segment + similar text)."""
+    seen: set = set()
+    unique = []
+    for node in nodes:
+        key = _node_dedupe_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(node)
+    return unique
+
+
+def dedupe_source_nodes(nodes: list) -> list:
+    """Dedupe citation lines for CLI display (by page range + file + segment)."""
+    seen: set = set()
+    unique = []
+    for node in nodes:
+        m = node.metadata or {}
+        key = (m.get("file_name"), m.get("page_start"), m.get("page_end"), m.get("doc_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(node)
+    return unique
+
+
+# =============================================================================
+# 10. INDEXING
 # =============================================================================
 
 def build_index(documents: List[Document]) -> VectorStoreIndex:
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    return VectorStoreIndex.from_documents(documents, transformations=[splitter])
+    nodes = splitter.get_nodes_from_documents(documents)
+    nodes = dedupe_nodes(nodes)
+    logging.info("Indexing %d unique chunk(s) after deduplication", len(nodes))
+    return VectorStoreIndex(nodes=nodes)
 
 
 # =============================================================================
-# 10. HYBRID RETRIEVER
+# 11. HYBRID RETRIEVER
 # =============================================================================
 
 class HybridRetriever(BaseRetriever):
@@ -660,20 +817,23 @@ class HybridRetriever(BaseRetriever):
         vector_nodes  = self.vector_retriever.retrieve(query_bundle)
         keyword_nodes = self.bm25_retriever.retrieve(query_bundle)
 
-        seen:   Dict[str, NodeWithScore] = {}
+        by_key: Dict[tuple, NodeWithScore] = {}
         for node in vector_nodes + keyword_nodes:
-            if node.node_id not in seen:
-                seen[node.node_id] = node
+            key = _node_dedupe_key(node)
+            prev = by_key.get(key)
+            if prev is None or (node.score or 0) > (prev.score or 0):
+                by_key[key] = node
 
-        return sorted(
-            seen.values(),
+        merged = sorted(
+            by_key.values(),
             key=lambda n: n.score if n.score is not None else 0.0,
             reverse=True,
-        )[:self.top_k]
+        )
+        return merged[:self.top_k]
 
 
 # =============================================================================
-# 11. PIPELINE ASSEMBLY
+# 12. PIPELINE ASSEMBLY
 # =============================================================================
 
 def _make_engine(index: VectorStoreIndex, nodes: list) -> RetrieverQueryEngine:
@@ -705,7 +865,40 @@ def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
 
 
 # =============================================================================
-# 12. CLI ENTRY POINT
+# 13. INGEST WITH STORAGE (Phase 2)
+# =============================================================================
+
+def ingest_pdf(
+    pdf_path: str,
+    blob_store: Optional[BlobStore] = None,
+    metadata: Optional[MetadataStore] = None,
+) -> Tuple[VectorStoreIndex, RetrieverQueryEngine, str]:
+    """Ingest a PDF with blob persistence + metadata lineage."""
+    blob_store = blob_store or BlobStore()
+    metadata = metadata or MetadataStore()
+
+    file_name = os.path.basename(pdf_path)
+    file_bytes = Path(pdf_path).read_bytes()
+    blob_id = blob_store.put(file_bytes, file_name)
+    job_id = metadata.create_job(blob_id, file_name)
+    metadata.update_job(job_id, "processing")
+
+    try:
+        version_id = metadata.create_version(job_id, blob_id, file_name, file_bytes)
+        docs = load_pdf(pdf_path)
+        index = build_index(docs)
+        nodes = list(index.docstore.docs.values())
+        metadata.record_chunks(version_id, nodes)
+        metadata.update_job(job_id, "ready", segment_count=len(docs))
+        engine = build_rag_pipeline(index)
+        return index, engine, job_id
+    except Exception as e:
+        metadata.update_job(job_id, "failed", error=str(e))
+        raise
+
+
+# =============================================================================
+# 14. CLI ENTRY POINT
 # =============================================================================
 
 def main():
@@ -715,11 +908,9 @@ def main():
         return
 
     print(f"\nLoading {os.path.basename(pdf_path)}…")
-    docs   = load_pdf(pdf_path)
-    index  = build_index(docs)
-    engine = build_rag_pipeline(index)
-
-    print(f"Ingested {len(docs)} logical segment(s) from {len(page_manifest)} page(s).")
+    index, engine, job_id = ingest_pdf(pdf_path)
+    print(f"Job {job_id} ready — blobs/metadata under ./data/rag/")
+    print(f"Ingested logical segments from {len(page_manifest)} page(s).")
     print('Ready — type your question or "exit" to quit.\n')
 
     while True:
@@ -729,9 +920,10 @@ def main():
         if query.lower() in ("exit", "quit"):
             break
 
-        response = engine.query(query)
+        search_query = rewrite_query(query)
+        response = engine.query(search_query)
         print(f"\n{response}\n")
-        for node in response.source_nodes:
+        for node in dedupe_source_nodes(response.source_nodes):
             m = node.metadata
             print(
                 f"  [p.{m.get('page_start')}-{m.get('page_end')}  "

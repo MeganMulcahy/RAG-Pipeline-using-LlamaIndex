@@ -40,6 +40,8 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
    GEMINI_API_KEY=your_key_here
    TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
    MAX_EXTRACT_WORKERS=4
+   QUERY_REWRITE=true
+   DATA_DIR=./data/rag
    ```
 
 3. Install Tesseract OCR (required for scanned/image-heavy pages):
@@ -56,14 +58,22 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
    ```
    Enter a PDF path when prompted, then ask questions. Type `exit` to quit.
 
+### Inspect ingest output (sample pages)
+
+To see what the pipeline actually extracts (1 text page, 3 table pages, 3 scanned/OCR pages):
+
+```bash
+python test_ingest_sample.py "your.pdf" --full -o ingest_sample_report.txt
+```
+
+Requires `TESSERACT_CMD` in `.env` for `image_dominant` pages.
+
 ## Architecture Progress Tracker
 
 | Date | Status | Details |
 |---|---|---|
 | 2026-05-28 | Pipeline v1 | PDF extraction (PyMuPDF + Tesseract OCR fallback); classification + boundary detection + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex); optional query routing |
-| 2026-05-28 | Ingest refactor (current) | Two-pass ingest: fitz page classification (`native_text` / `image_dominant` / `table_heavy`) → batched `pymupdf4llm`, parallel `unstructured` (scanned tables), main-thread OCR (image pages); heuristic segmentation (domain-agnostic, no `doc_type`); compact `page_manifest`; full-index retrieval + Gemini (`google.genai`) |
-| Planned | Step 1 | Multi-format support beyond PDF (Word, Excel, slides, web pages) |
-| Planned | Step 2 | Document layout analysis before chunking (separate headers, tables, figures) |
-| Planned | Step 3 | Table recognition/extraction as structured data |
-| Planned | Step 4 | Storage/serving layer: object storage + metadata DB + async ingestion queue |
+| 2026-05-28 | Ingest refactor (current) | Two-pass ingest + heuristic segmentation + `page_manifest`; chunk dedup; query rewrite (typos); full-index hybrid retrieval + rerank + Gemini (`google.genai`) |
+| 2026-05-28 | Phase 2 (partial) | `storage.py`: local blob store (`./data/rag/blobs`), SQLite metadata (jobs, versions, chunk lineage); optional MinIO + Redis via env; sync ingest wired in CLI |
+| Planned | Step 4 | Phase 2 completion: Postgres metadata, background ingest worker, MinIO in prod |
 | Planned | Step 5 | Retrieval/API scale-up: dedicated vector DB, sparse service, REST auth, multi-tenant knowledge bases |
