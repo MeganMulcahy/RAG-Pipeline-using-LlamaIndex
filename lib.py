@@ -3,12 +3,16 @@ import sys
 
 REQUIRED_PACKAGES = [
     "llama-index",
-    "llama-index-llms-google-genai",
+    "google-genai",
     "llama-index-embeddings-huggingface",
     "llama-index-retrievers-bm25",
     "llama-index-llms-llama-cpp",
     "llama-index-llms-ollama",
     "pymupdf",
+    "pymupdf4llm",
+    "unstructured[pdf]",
+    "pytesseract",
+    "pillow",
     "llama-index-readers-file",
     "gradio",
 ]

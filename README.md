@@ -1,10 +1,10 @@
 # AI Mortgage Document Intelligence Automation System
 
-A RAG (Retrieval-Augmented Generation) pipeline for querying mortgage PDF documents using natural language.
+A RAG (Retrieval-Augmented Generation) pipeline for querying PDF documents using natural language.
 
 ## What It Does
 
-Upload a mortgage PDF and ask plain-English questions. The system extracts text, indexes it, and returns concise, grounded answers.
+Upload a PDF and ask plain-English questions. The system extracts text, indexes it, and returns concise, grounded answers.
 
 ## Tech Stack
 
@@ -40,7 +40,15 @@ Upload a mortgage PDF and ask plain-English questions. The system extracts text,
    QUERY_DOC_TYPE_ROUTING=false
    ```
 
-3. Run:
+3. Install Tesseract OCR (required for scanned/image-heavy pages):
+   - Windows (recommended): `winget install UB-Mannheim.TesseractOCR`
+   - Or download from: https://github.com/UB-Mannheim/tesseract/wiki
+   - If not on PATH, set in `.env`:
+     ```
+     TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+     ```
+
+4. Run:
    ```bash
    python rag_pipeline.py
    ```
@@ -50,7 +58,7 @@ Upload a mortgage PDF and ask plain-English questions. The system extracts text,
 
 | Date | Status | Details |
 |---|---|---|
-| 2026-05-28 | Current Pipeline | PDF extraction (PyMuPDF + Tesseract OCR fallback); classification + boundary detection + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex); optional query routing |
+| 2026-05-28 | Current Pipeline | PDF extraction (PyMuPDF + Tesseract OCR fallback); heuristic segmentation + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex) |
 | Planned | Step 1 | Multi-format support beyond PDF (Word, Excel, slides, web pages) |
 | Planned | Step 2 | Document layout analysis before chunking (separate headers, tables, figures) |
 | Planned | Step 3 | Table recognition/extraction as structured data |

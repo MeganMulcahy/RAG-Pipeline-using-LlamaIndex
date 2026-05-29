@@ -6,27 +6,27 @@ Structure
 1. Config & setup
 2. Data classes        (PageInfo, LogicalDocument)
 3. PDF extraction      (blob_reader — fitz + OCR fallback)
-4. Classification      (keyword labels; Gemini only if INGEST_LLM=true)
-5. Boundary detection  (heuristics; Gemini only if INGEST_LLM=true)
-6. Document grouping   (group_logical_docs)
-7. PDF loading         (load_pdf → LlamaIndex Documents)
-8. Indexing            (build_index — SentenceSplitter)
-9. Hybrid retrieval    (HybridRetriever — BM25 + vector)
-10. Pipeline           (build_rag_pipeline, build_filtered_engine)
-11. Query routing      (optional keyword filter; full-index search by default)
-12. CLI entry point
+4. Boundary detection  (heuristics — split multi-doc PDF blobs)
+5. Document grouping   (group_logical_docs)
+6. PDF loading         (load_pdf → LlamaIndex Documents)
+7. Indexing            (build_index — SentenceSplitter)
+8. Hybrid retrieval    (HybridRetriever — BM25 + vector)
+9. Pipeline            (build_rag_pipeline)
+10. CLI entry point
 """
 
 import io
 import logging
 import os
 import re
+import shutil
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from llama_index.core import Document, Settings, VectorStoreIndex
 from llama_index.core.llms import CompletionResponse, CustomLLM, LLMMetadata
@@ -35,7 +35,6 @@ from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
 
@@ -44,7 +43,10 @@ load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Silence chatty third-party loggers
-for _log in ("httpx", "huggingface_hub", "sentence_transformers"):
+for _log in (
+    "httpx", "huggingface_hub", "sentence_transformers",
+    "pikepdf", "unstructured", "pdfminer", "PIL",
+):
     logging.getLogger(_log).setLevel(logging.WARNING)
 
 
@@ -58,47 +60,19 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE      = 512
 CHUNK_OVERLAP   = 100
 TOP_K           = 4
+MAX_EXTRACT_WORKERS = int(os.getenv("MAX_EXTRACT_WORKERS", "4"))
+TESSERACT_CMD       = os.getenv("TESSERACT_CMD", "")
 
-# Query: pre-filter by doc_type keywords (set true to enable). Default searches full index.
-QUERY_DOC_TYPE_ROUTING = os.getenv("QUERY_DOC_TYPE_ROUTING", "false").lower() == "true"
-
-_DOC_TYPES = [
-    "Resume", "Contract", "Mortgage Contract", "Invoice", "Pay Slip",
-    "Lender Fee Sheet", "Land Deed", "Bank Statement", "Tax Document",
-    "Insurance", "Report", "Letter", "Form", "ID Document", "Medical", "Other",
-]
-
-_KEYWORD_RULES = [
-    ("Resume",            ["resume", "curriculum vitae", " cv ", "work experience", "education", "skills", "objective"]),
-    ("Lender Fee Sheet",  ["loan estimate", "closing disclosure", "origination charge", "apr", "annual percentage rate",
-                           "discount point", "closing cost", "lender credit", "prepaid interest", "cash to close"]),
-    ("Mortgage Contract", ["mortgage", "deed of trust", "promissory note", "deed of mortgage", "home loan"]),
-    ("Contract",          ["agreement", "whereas", "hereinafter", "obligations", "parties agree", "terms and conditions"]),
-    ("Invoice",           ["invoice", "bill to", "amount due", "payment terms", "subtotal", "purchase order"]),
-    ("Pay Slip",          ["pay stub", "pay slip", "payslip", "gross pay", "net pay", "deductions", "ytd", "federal tax"]),
-    ("Land Deed",         ["deed", "grantor", "grantee", "real property", "parcel", "legal description", "county recorder"]),
-    ("Bank Statement",    ["account number", "statement period", "beginning balance", "ending balance", "deposits", "withdrawals"]),
-    ("Tax Document",      ["form w-2", "form 1099", "form 1040", "taxable income", "withholding", "irs", "tax return"]),
-    ("Insurance",         ["policy number", "insured", "coverage", "premium", "deductible", "beneficiary", "underwriter"]),
-    ("Medical",           ["patient", "diagnosis", "physician", "prescription", "medical record", "treatment", "dosage"]),
-]
+_tesseract_available: Optional[bool] = None
+_tesseract_warned    = False
 
 _PAGE_RE = re.compile(r'\bpage\s+\d+\s+of\s+\d+\b', re.IGNORECASE)
-
-
-def _keyword_classify(text: str) -> Optional[str]:
-    """Return a doc type if 2+ keywords match, else None."""
-    lower = text.lower()
-    for doc_type, keywords in _KEYWORD_RULES:
-        if sum(1 for kw in keywords if kw in lower) >= 2:
-            return doc_type
-    return None
 
 
 def _heuristic_boundary(curr_text: str) -> Optional[bool]:
     """
     Returns True  → definitely same doc.
-    Returns None  → uncertain (keyword mismatch rule decides).
+    Returns None  → uncertain (defaults to same document).
     """
     stripped = curr_text.strip()
     if len(stripped) < 120:
@@ -108,21 +82,6 @@ def _heuristic_boundary(curr_text: str) -> Optional[bool]:
     return None
 
 
-_QUERY_ROUTING_RULES = [
-    ("Lender Fee Sheet",  ["origination", "closing cost", "discount point", "appraisal fee", "apr"]),
-    ("Pay Slip",          ["salary", "gross pay", "net pay", "paycheck", "deductions", "ytd"]),
-    ("Bank Statement",    ["account balance", "deposits", "withdrawals", "bank statement"]),
-    ("Tax Document",      ["w-2", "1099", "taxable income", "irs", "tax return"]),
-    ("Invoice",           ["invoice", "bill to", "amount due", "purchase order"]),
-    ("Mortgage Contract", ["mortgage", "promissory note", "deed of trust", "escrow", "loan amount"]),
-    ("Land Deed",         ["grantor", "grantee", "parcel", "legal description"]),
-    ("Contract",          ["agreement", "obligations", "indemnification", "whereas"]),
-    ("Resume",            ["resume", "work experience", "employment history"]),
-    ("Insurance",         ["policy number", "premium", "coverage", "deductible"]),
-    ("Medical",           ["diagnosis", "prescription", "patient", "physician"]),
-]
-
-
 # =============================================================================
 # 2. GEMINI + EMBEDDING SETUP
 # =============================================================================
@@ -130,14 +89,11 @@ _QUERY_ROUTING_RULES = [
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not set. Add it to your .env file.")
 
-_key_preview = f"{GEMINI_API_KEY[:4]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 8 else "too short"
-logging.info("Gemini key loaded: %s (len=%d)", _key_preview, len(GEMINI_API_KEY))
-genai.configure(api_key=GEMINI_API_KEY)
-_gemini = genai.GenerativeModel(GEMINI_MODEL)
+_gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 class GeminiLLM(CustomLLM):
-    """Minimal LlamaIndex-compatible wrapper around google.generativeai."""
+    """Minimal LlamaIndex-compatible wrapper around google.genai."""
     context_window: int = 8192
     num_output: int     = 1024
     model_name: str     = GEMINI_MODEL
@@ -151,8 +107,12 @@ class GeminiLLM(CustomLLM):
         )
 
     def complete(self, prompt: str, **_) -> CompletionResponse:
-        text = _gemini.generate_content(prompt).text or ""
-        return CompletionResponse(text=text.strip())
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        return CompletionResponse(text=text)
 
     def stream_complete(self, prompt: str, **_):
         yield self.complete(prompt)
@@ -170,16 +130,17 @@ Settings.embed_model = _embed
 
 @dataclass
 class PageInfo:
-    page_num:   int
-    text:       str
-    doc_type:   Optional[str] = None
-    page_in_doc: int          = 0
+    page_num:     int
+    text:         str
+    page_in_doc:  int           = 0
+    content_type: str          = "native_text"
+    char_count:   int          = 0
+    table_html:   Optional[str] = None
 
 
 @dataclass
 class LogicalDocument:
     doc_id:     str
-    doc_type:   str
     page_start: int
     page_end:   int
     text:       str
@@ -189,61 +150,365 @@ class LogicalDocument:
 # 4. PDF EXTRACTION
 # =============================================================================
 
+def parse_manifest_entry(entry: str) -> dict:
+    """Parse compact manifest: page|page_in_doc|file_id|file_name|content_type"""
+    page, page_in_doc, file_id, file_name, content_type = entry.split("|", 4)
+    return {
+        "page":         int(page),
+        "page_in_doc":  int(page_in_doc),
+        "file_id":      file_id,
+        "file_name":    file_name,
+        "content_type": content_type,
+    }
+
+
+def _classify_page_content_type(page, char_count: int) -> str:
+    """Pass 1: fitz-only signals → native_text | image_dominant | table_heavy."""
+    page_area  = page.rect.width * page.rect.height or 1.0
+
+    image_area = 0.0
+    for block in page.get_text("blocks"):
+        if block[6] == 1:
+            x0, y0, x1, y1 = block[0], block[1], block[2], block[3]
+            image_area += (x1 - x0) * (y1 - y0)
+
+    line_count = 0
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") == 0:
+            line_count += len(block.get("lines", []))
+
+    rect_count  = len(page.get_drawings())
+    image_ratio = image_area / page_area
+
+    if rect_count > 20 and line_count > 10:
+        return "table_heavy"
+    if char_count > 100 and image_ratio < 0.6:
+        return "native_text"
+    if image_ratio >= 0.6 or char_count < 50:
+        return "image_dominant"
+    return "native_text"
+
+
+def _configure_tesseract() -> bool:
+    """Detect Tesseract once; set pytesseract path on Windows if needed."""
+    global _tesseract_available
+    if _tesseract_available is not None:
+        return _tesseract_available
+
+    candidates = []
+    if TESSERACT_CMD:
+        candidates.append(TESSERACT_CMD)
+    which = shutil.which("tesseract")
+    if which:
+        candidates.append(which)
+    candidates.extend([
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ])
+
+    for cmd in candidates:
+        if cmd and os.path.isfile(cmd):
+            try:
+                import pytesseract
+                pytesseract.pytesseract.tesseract_cmd = cmd
+                _tesseract_available = True
+                logging.debug("Tesseract configured: %s", cmd)
+                return True
+            except Exception:
+                continue
+
+    _tesseract_available = False
+    return False
+
+
+def _warn_tesseract_missing() -> None:
+    global _tesseract_warned
+    if _tesseract_warned:
+        return
+    _tesseract_warned = True
+    logging.warning(
+        "Tesseract OCR is not installed or not on PATH. "
+        "Install from https://github.com/UB-Mannheim/tesseract/wiki "
+        "or set TESSERACT_CMD in .env. Scanned pages will use fitz text only."
+    )
+
+
+def _get_tesseract_cmd() -> str:
+    """Resolved tesseract.exe path for main process and worker processes."""
+    if _configure_tesseract():
+        import pytesseract
+        return pytesseract.pytesseract.tesseract_cmd
+    return TESSERACT_CMD if TESSERACT_CMD and os.path.isfile(TESSERACT_CMD) else ""
+
+
+def _apply_tesseract_cmd(cmd: str) -> None:
+    """Configure tesseract in a worker process (ProcessPool children)."""
+    if not cmd or not os.path.isfile(cmd):
+        return
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = cmd
+    tess_dir = os.path.dirname(cmd)
+    os.environ["PATH"] = tess_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+def _log_page_extraction(pinfo: PageInfo, extractor: str) -> None:
+    print(
+        f"  Page {pinfo.page_num}: content_type={pinfo.content_type} "
+        f"extractor={extractor} chars={len(pinfo.text)}"
+    )
+
+
+def _fitz_page_text(page) -> str:
+    return page.get_text().strip()
+
+
+def _ocr_page_text(page, page_num: int) -> str:
+    """pytesseract fallback for scanned pages when unstructured is unavailable."""
+    if not _configure_tesseract():
+        _warn_tesseract_missing()
+        return ""
+    try:
+        from PIL import Image
+        import pytesseract
+        pix = page.get_pixmap()
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img)
+    except Exception as e:
+        logging.warning("Page %d: OCR failed — %s", page_num, e)
+        return ""
+
+
+def _finalize_slow_page(
+    doc,
+    pinfo: PageInfo,
+    text: str,
+    table_html: Optional[str],
+    extractor: str,
+) -> None:
+    """fitz → OCR (if installed) so pages are not left empty."""
+    if not text.strip():
+        fitz_text = _fitz_page_text(doc[pinfo.page_num])
+        if fitz_text:
+            text = fitz_text
+            extractor = "fitz_fallback"
+
+    if not text.strip() and _configure_tesseract():
+        text = _ocr_page_text(doc[pinfo.page_num], pinfo.page_num)
+        if text.strip():
+            extractor = "pytesseract"
+    elif not text.strip():
+        _warn_tesseract_missing()
+
+    pinfo.text = text
+    pinfo.table_html = table_html
+    _log_page_extraction(pinfo, extractor if text.strip() else "none")
+
+
+def _chunk_to_text(chunk) -> str:
+    if isinstance(chunk, dict):
+        return str(chunk.get("text", "") or "").strip()
+    return str(chunk).strip()
+
+
+def _extract_native_text_batch(path: str, page_indices: List[int]) -> Dict[int, str]:
+    """One pymupdf4llm call for all native_text pages."""
+    if not page_indices:
+        return {}
+    import pymupdf4llm
+
+    chunks = pymupdf4llm.to_markdown(path, pages=page_indices, page_chunks=True)
+    out: Dict[int, str] = {}
+
+    if isinstance(chunks, list):
+        for i, page_idx in enumerate(page_indices):
+            if i < len(chunks):
+                text = _chunk_to_text(chunks[i])
+                if text:
+                    out[page_idx] = text
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            meta = chunk.get("metadata") or {}
+            pg = meta.get("page") if isinstance(meta, dict) else chunk.get("page")
+            if pg is not None:
+                text = _chunk_to_text(chunk)
+                if text:
+                    out[int(pg)] = text
+    elif len(page_indices) == 1:
+        out[page_indices[0]] = str(chunks).strip()
+
+    return out
+
+
+def _elements_to_text_and_html(elements) -> Tuple[str, Optional[str]]:
+    texts: List[str] = []
+    table_html: Optional[str] = None
+    for el in elements:
+        txt = str(getattr(el, "text", "") or "").strip()
+        if txt:
+            texts.append(txt)
+        meta = getattr(el, "metadata", None)
+        html = getattr(meta, "text_as_html", None) if meta else None
+        if html and getattr(el, "category", "") == "Table":
+            table_html = html
+    return "\n".join(texts), table_html
+
+
+def _extract_single_page(
+    args: Tuple[str, int, str, int, str],
+) -> Tuple[int, str, Optional[str], str]:
+    """
+    Top-level worker for ProcessPoolExecutor (must be picklable).
+    args: (path, page_num, content_type, char_count, tesseract_cmd)
+    """
+    path, page_num, content_type, char_count, tesseract_cmd = args
+    _apply_tesseract_cmd(tesseract_cmd)
+    try:
+        from unstructured.partition.auto import partition
+
+        strategy = "hi_res" if char_count < 50 else "fast"
+        kwargs = {
+            "filename":     path,
+            "strategy":     strategy,
+            "page_numbers": [page_num + 1],
+            "languages":    ["eng"],
+        }
+        if content_type == "table_heavy":
+            kwargs["infer_table_structure"] = True
+
+        elements = partition(**kwargs)
+        text, table_html = _elements_to_text_and_html(elements)
+        label = f"unstructured_{strategy}"
+        if content_type == "table_heavy":
+            label += "_table"
+        return page_num, text, table_html, label
+    except Exception as e:
+        logging.warning("Page %d: unstructured worker failed — %s", page_num, e)
+        return page_num, "", None, "unstructured_error"
+
+
 def blob_reader(pdf_path) -> List[PageInfo]:
     """
     Open a PDF from a file path, file-like object, or dict with 'content' key.
-    Extracts text per page; falls back to pytesseract OCR for scanned pages.
+
+    Pass 1: fitz-only page classification (native_text / image_dominant / table_heavy).
+    Pass 2: routed extraction via pymupdf4llm or unstructured; OCR if needed.
     """
+    temp_path = None
     if isinstance(pdf_path, dict) and "content" in pdf_path:
-        doc = fitz.open(stream=pdf_path["content"], filetype="pdf")
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.write(pdf_path["content"])
+        tmp.close()
+        path = temp_path = tmp.name
+        doc  = fitz.open(path)
     elif hasattr(pdf_path, "read"):
-        doc = fitz.open(stream=pdf_path.read(), filetype="pdf")
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.write(pdf_path.read())
+        tmp.close()
+        path = temp_path = tmp.name
+        doc  = fitz.open(path)
     else:
-        doc = fitz.open(pdf_path)
+        path = str(pdf_path)
+        doc  = fitz.open(path)
 
     pages: List[PageInfo] = []
-    for i, page in enumerate(doc):
-        text = page.get_text()
+    try:
+        # Pass 1 — classify every page (fitz only)
+        for i, page in enumerate(doc):
+            char_count = len(page.get_text())
+            content_type = _classify_page_content_type(page, char_count)
+            pages.append(PageInfo(
+                page_num=i,
+                text="",
+                content_type=content_type,
+                char_count=char_count,
+            ))
 
-        if not text.strip():
+        # Pass 2a — batched pymupdf4llm (native_text + table_heavy pages with text layer)
+        markdown_pages = [
+            p.page_num for p in pages
+            if p.content_type == "native_text"
+            or (p.content_type == "table_heavy" and p.char_count >= 50)
+        ]
+        markdown_texts: Dict[int, str] = {}
+        if markdown_pages:
             try:
-                from PIL import Image
-                import pytesseract
-                pix  = page.get_pixmap()
-                img  = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(img)
-                print(f"  Page {i}: OCR extracted {len(text)} chars")
+                markdown_texts = _extract_native_text_batch(path, markdown_pages)
+                logging.info(
+                    "pymupdf4llm batch: %d page(s) in one call",
+                    len(markdown_pages),
+                )
             except Exception as e:
-                logging.warning(f"Page {i}: OCR failed — {e}")
-                text = ""
+                logging.warning("pymupdf4llm batch failed — %s", e)
 
-        pages.append(PageInfo(page_num=i, text=text))
+        for pinfo in pages:
+            if pinfo.page_num not in markdown_pages:
+                continue
+            text = markdown_texts.get(pinfo.page_num, "")
+            extractor = "pymupdf4llm"
+            if not text.strip():
+                text = _fitz_page_text(doc[pinfo.page_num])
+                extractor = "fitz_fallback"
+            pinfo.text = text
+            _log_page_extraction(pinfo, extractor)
 
-    doc.close()
+        tesseract_cmd = _get_tesseract_cmd()
+
+        # image_dominant: OCR in main process (fast; avoids unstructured re-reading PDF)
+        for pinfo in pages:
+            if pinfo.content_type == "image_dominant":
+                _finalize_slow_page(doc, pinfo, "", None, "pending")
+
+        # table_heavy scanned pages only — unstructured in parallel workers
+        slow_args = [
+            (path, p.page_num, p.content_type, p.char_count, tesseract_cmd)
+            for p in pages
+            if p.content_type == "table_heavy" and p.char_count < 50
+        ]
+        slow_results: Dict[int, Tuple[str, Optional[str], str]] = {}
+        if slow_args:
+            workers = min(MAX_EXTRACT_WORKERS, len(slow_args))
+            logging.info(
+                "unstructured parallel: %d page(s), %d worker(s)",
+                len(slow_args), workers,
+            )
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_extract_single_page, args): args
+                    for args in slow_args
+                }
+                for future in as_completed(futures):
+                    page_num, text, table_html, extractor = future.result()
+                    slow_results[page_num] = (text, table_html, extractor)
+
+        for pinfo in pages:
+            if pinfo.page_num in markdown_pages or pinfo.content_type != "table_heavy":
+                continue
+            text, table_html, extractor = slow_results.get(
+                pinfo.page_num, ("", None, "unstructured_error"),
+            )
+            _finalize_slow_page(doc, pinfo, text, table_html, extractor)
+    finally:
+        doc.close()
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
     return pages
 
 
 # =============================================================================
-# 5. DOCUMENT CLASSIFICATION
+# 5. BOUNDARY DETECTION
 # =============================================================================
 
-def classify_document_type(text: str) -> str:
-    """Keyword label for metadata."""
-    fast = _keyword_classify(text)
-    if fast:
-        return fast
-    return "Other"
-
-
-# =============================================================================
-# 6. BOUNDARY DETECTION
-# =============================================================================
-
-def detect_document_boundary(prev_text: str, curr_text: str,
-                              doc_type: str = None) -> bool:
+def detect_document_boundary(prev_text: str, curr_text: str) -> bool:
     """
-    Returns True if the two pages belong to the SAME document.
-    Heuristics first; then keyword mismatch rule.
+    Returns True if the two pages belong to the SAME logical document.
+    Uses layout heuristics only (domain-agnostic).
     """
     if not prev_text or not curr_text:
         return False
@@ -252,23 +517,18 @@ def detect_document_boundary(prev_text: str, curr_text: str,
     if hint is not None:
         return hint
 
-    prev_kw = _keyword_classify(prev_text)
-    curr_kw = _keyword_classify(curr_text)
-    if prev_kw and curr_kw and prev_kw != curr_kw:
-        return False
     return True
 
 
 # =============================================================================
-# 7. DOCUMENT GROUPING
+# 6. DOCUMENT GROUPING
 # =============================================================================
 
 def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
-    """Group a flat list of classified PageInfo objects into logical documents."""
+    """Group pages into logical documents using page_in_doc boundaries."""
     logical_docs: List[LogicalDocument] = []
-    current_pages: List[PageInfo]       = []
-    current_type: Optional[str]         = None
-    doc_counter                         = 0
+    current_pages: List[PageInfo] = []
+    doc_counter = 0
 
     for page in pages:
         if not page.text.strip():
@@ -277,7 +537,6 @@ def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
         if page.page_in_doc == 0 and current_pages:
             logical_docs.append(LogicalDocument(
                 doc_id     = f"doc_{doc_counter}",
-                doc_type   = current_type,
                 page_start = current_pages[0].page_num,
                 page_end   = current_pages[-1].page_num,
                 text       = "\n\n".join(p.text for p in current_pages),
@@ -286,12 +545,10 @@ def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
             current_pages = []
 
         current_pages.append(page)
-        current_type = page.doc_type
 
     if current_pages:
         logical_docs.append(LogicalDocument(
             doc_id     = f"doc_{doc_counter}",
-            doc_type   = current_type,
             page_start = current_pages[0].page_num,
             page_end   = current_pages[-1].page_num,
             text       = "\n\n".join(p.text for p in current_pages),
@@ -301,19 +558,19 @@ def group_logical_docs(pages: List[PageInfo]) -> List[LogicalDocument]:
 
 
 # =============================================================================
-# 8. PDF LOADING  →  LlamaIndex Documents
+# 7. PDF LOADING  →  LlamaIndex Documents
 # =============================================================================
 
-pdf_metadata_store: List[Dict] = []   # populated by load_pdf; used for routing
+page_manifest: List[str] = []   # populated by load_pdf; compact per-page metadata
 
 
 def load_pdf(pdf_path) -> List[Document]:
     """
     Full ingestion pipeline for one PDF:
-      blob_reader → keyword classify → heuristic boundaries → group → Documents
+      blob_reader → heuristic boundaries → group → Documents
     """
-    global pdf_metadata_store
-    pdf_metadata_store = []
+    global page_manifest
+    page_manifest = []
 
     pages     = blob_reader(pdf_path)
     file_name = (
@@ -324,11 +581,7 @@ def load_pdf(pdf_path) -> List[Document]:
     total_pages = len(pages)
     non_empty   = [(i, p) for i, p in enumerate(pages) if p.text.strip()]
 
-    print(f"\n  Labeling {len(non_empty)}/{total_pages} pages (keywords + continuity)…")
-    for page in pages:
-        if page.text.strip():
-            # Keep raw keyword label only; if absent, decide later using boundary continuity.
-            page.doc_type = _keyword_classify(page.text)
+    print(f"\n  Segmenting {len(non_empty)}/{total_pages} pages (heuristic boundaries)…")
 
     page_in_doc = 0
     prev_page: Optional[PageInfo] = None
@@ -338,41 +591,22 @@ def load_pdf(pdf_path) -> List[Document]:
             continue
 
         if prev_page is None:
-            if not page.doc_type:
-                page.doc_type = "Other"
             page_in_doc = 0
         else:
-            prev_type = prev_page.doc_type or "Other"
-            curr_type = page.doc_type
-            same = detect_document_boundary(prev_page.text, page.text, prev_type)
-
-            if curr_type is None:
-                # No new keyword hit on this page: inherit type if boundary says continuation.
-                if same:
-                    page.doc_type = prev_type
-                    page_in_doc += 1
-                else:
-                    page.doc_type = "Other"
-                    page_in_doc = 0
-            elif curr_type != prev_type:
-                # Strong keyword shift starts a new logical document.
-                page_in_doc = 0
-            else:
-                page_in_doc = page_in_doc + 1 if same else 0
+            same = detect_document_boundary(prev_page.text, page.text)
+            page_in_doc = page_in_doc + 1 if same else 0
 
         page.page_in_doc = page_in_doc
         prev_page        = page
 
-        print(f"  Page {page.page_num + 1}/{total_pages} | {page.doc_type:<20} | page_in_doc: {page_in_doc}")
+        print(
+            f"  Page {page.page_num + 1}/{total_pages} | "
+            f"{page.content_type:<14} | segment_page: {page_in_doc}"
+        )
 
-        pdf_metadata_store.append({
-            "page":        page.page_num,
-            "text":        page.text,
-            "doc_type":    page.doc_type,
-            "page_in_doc": page_in_doc,
-            "file_id":     file_id,
-            "file_name":   file_name,
-        })
+        page_manifest.append(
+            f"{page.page_num}|{page_in_doc}|{file_id}|{file_name}|{page.content_type}"
+        )
 
     logical_docs = group_logical_docs(pages)
     print(f"\n  {len(logical_docs)} logical document(s) identified.")
@@ -383,7 +617,7 @@ def load_pdf(pdf_path) -> List[Document]:
             metadata = {
                 "file_id":    file_id,
                 "file_name":  file_name,
-                "doc_type":   doc.doc_type,
+                "doc_id":     doc.doc_id,
                 "page_start": doc.page_start,
                 "page_end":   doc.page_end,
             },
@@ -442,19 +676,9 @@ class HybridRetriever(BaseRetriever):
 # 11. PIPELINE ASSEMBLY
 # =============================================================================
 
-def _make_engine(
-    index: VectorStoreIndex,
-    nodes: list,
-    doc_type_filter: Optional[str] = None,
-) -> RetrieverQueryEngine:
+def _make_engine(index: VectorStoreIndex, nodes: list) -> RetrieverQueryEngine:
     safe_k = min(TOP_K, max(1, len(nodes)))
-
-    if doc_type_filter:
-        filters         = MetadataFilters(filters=[MetadataFilter(key="doc_type", value=doc_type_filter)])
-        vector_retriever = index.as_retriever(similarity_top_k=safe_k, filters=filters)
-    else:
-        vector_retriever = index.as_retriever(similarity_top_k=safe_k)
-
+    vector_retriever = index.as_retriever(similarity_top_k=safe_k)
     bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=safe_k)
     hybrid         = HybridRetriever(vector_retriever, bm25_retriever, top_k=safe_k)
 
@@ -480,48 +704,8 @@ def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
     return _make_engine(index, nodes)
 
 
-def build_filtered_engine(
-    index: VectorStoreIndex, doc_type: str
-) -> Optional[RetrieverQueryEngine]:
-    all_nodes = list(index.docstore.docs.values())
-    filtered  = [n for n in all_nodes if n.metadata.get("doc_type") == doc_type]
-    return _make_engine(index, filtered, doc_type_filter=doc_type) if filtered else None
-
-
 # =============================================================================
-# 12. QUERY ROUTING
-# =============================================================================
-
-def fast_route_by_keywords(query: str) -> Optional[str]:
-    """Map query terms to a loaded doc_type — no LLM. Returns None if no match."""
-    available = {m["doc_type"] for m in pdf_metadata_store}
-    if not available:
-        return None
-    if len(available) == 1:
-        return next(iter(available))
-
-    lower = query.lower()
-    for doc_type, keywords in _QUERY_ROUTING_RULES:
-        if doc_type not in available:
-            continue
-        if any(kw in lower for kw in keywords):
-            return doc_type
-    return None
-
-
-def resolve_query_doc_type(query: str) -> Optional[str]:
-    """Optional pre-filter; None means search the full index (default)."""
-    if not QUERY_DOC_TYPE_ROUTING:
-        return None
-    return fast_route_by_keywords(query)
-
-
-def retrieve_files_by_doc_type(doc_type: str) -> list:
-    return [m for m in pdf_metadata_store if m["doc_type"] == doc_type]
-
-
-# =============================================================================
-# 13. CLI ENTRY POINT
+# 12. CLI ENTRY POINT
 # =============================================================================
 
 def main():
@@ -535,8 +719,7 @@ def main():
     index  = build_index(docs)
     engine = build_rag_pipeline(index)
 
-    types = sorted({m["doc_type"] for m in pdf_metadata_store})
-    print(f"Types detected: {', '.join(types)}")
+    print(f"Ingested {len(docs)} logical segment(s) from {len(page_manifest)} page(s).")
     print('Ready — type your question or "exit" to quit.\n')
 
     while True:
@@ -546,19 +729,14 @@ def main():
         if query.lower() in ("exit", "quit"):
             break
 
-        predicted = resolve_query_doc_type(query)
-        matched   = retrieve_files_by_doc_type(predicted) if predicted else []
-        q_engine  = build_filtered_engine(index, predicted) if matched else engine
-        if QUERY_DOC_TYPE_ROUTING and predicted:
-            print(f"  Routing to: {predicted} ({len(matched)} page(s))")
-        else:
-            print("  Searching full document index")
-
-        response = q_engine.query(query)
+        response = engine.query(query)
         print(f"\n{response}\n")
         for node in response.source_nodes:
             m = node.metadata
-            print(f"  [{m.get('doc_type')}  p.{m.get('page_start')}-{m.get('page_end')}  {m.get('file_name')}]")
+            print(
+                f"  [p.{m.get('page_start')}-{m.get('page_end')}  "
+                f"{m.get('file_name')}  {m.get('doc_id')}]"
+            )
         print("-" * 60)
 
 
