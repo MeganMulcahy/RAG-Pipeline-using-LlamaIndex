@@ -40,9 +40,9 @@ from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
 
-from storage import BlobStore, IngestQueue, MetadataStore
-
 load_dotenv(override=True)
+
+PDF_EXTENSION = ".pdf"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -712,11 +712,55 @@ def load_pdf(pdf_path) -> List[Document]:
 
 
 def load_pdfs(paths: List[str]) -> List[Document]:
-    """Load and classify multiple PDF files."""
+    """Load multiple files (PDF or other supported types)."""
     all_docs: List[Document] = []
     for path in paths:
-        all_docs.extend(load_pdf(path))
+        all_docs.extend(load_file(path))
     return all_docs
+
+
+def _load_unstructured_file(path: Path) -> List[Document]:
+    """Extract text from non-PDF files (Word, Excel, slides, HTML, images, txt, …)."""
+    global page_manifest
+    page_manifest = []
+
+    from unstructured.partition.auto import partition
+
+    _apply_tesseract_cmd(_get_tesseract_cmd())
+    print(f"\n  Extracting {path.name} via unstructured…")
+    elements = partition(filename=str(path), languages=["eng"])
+    text, table_html = _elements_to_text_and_html(elements)
+    if not text.strip():
+        raise ValueError(f"No text extracted from {path.name}")
+
+    file_id = str(uuid.uuid4())
+    page_manifest.append(f"0|0|{file_id}|{path.name}|unstructured")
+    metadata = {
+        "file_id":      file_id,
+        "file_name":    path.name,
+        "doc_id":       "doc_0",
+        "page_start":   0,
+        "page_end":     0,
+        "content_type": "unstructured",
+    }
+    if table_html:
+        metadata["has_tables"] = True
+
+    print(f"  Extracted {len(text)} characters from {path.name}")
+    return [Document(text=text, metadata=metadata)]
+
+
+def load_file(file_path) -> List[Document]:
+    """
+    Ingest one file. PDFs use the two-pass page pipeline; other types use
+    unstructured (partition.auto) — docx, xlsx, pptx, html, images, txt, etc.
+    """
+    path = Path(file_path)
+    if path.suffix.lower() == PDF_EXTENSION:
+        return load_pdf(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+    return _load_unstructured_file(path)
 
 
 # =============================================================================
@@ -865,36 +909,15 @@ def build_rag_pipeline(index: VectorStoreIndex) -> RetrieverQueryEngine:
 
 
 # =============================================================================
-# 13. INGEST WITH STORAGE (Phase 2)
+# 13. INGEST
 # =============================================================================
 
-def ingest_pdf(
-    pdf_path: str,
-    blob_store: Optional[BlobStore] = None,
-    metadata: Optional[MetadataStore] = None,
-) -> Tuple[VectorStoreIndex, RetrieverQueryEngine, str]:
-    """Ingest a PDF with blob persistence + metadata lineage."""
-    blob_store = blob_store or BlobStore()
-    metadata = metadata or MetadataStore()
-
-    file_name = os.path.basename(pdf_path)
-    file_bytes = Path(pdf_path).read_bytes()
-    blob_id = blob_store.put(file_bytes, file_name)
-    job_id = metadata.create_job(blob_id, file_name)
-    metadata.update_job(job_id, "processing")
-
-    try:
-        version_id = metadata.create_version(job_id, blob_id, file_name, file_bytes)
-        docs = load_pdf(pdf_path)
-        index = build_index(docs)
-        nodes = list(index.docstore.docs.values())
-        metadata.record_chunks(version_id, nodes)
-        metadata.update_job(job_id, "ready", segment_count=len(docs))
-        engine = build_rag_pipeline(index)
-        return index, engine, job_id
-    except Exception as e:
-        metadata.update_job(job_id, "failed", error=str(e))
-        raise
+def ingest_file(file_path: str) -> Tuple[VectorStoreIndex, RetrieverQueryEngine]:
+    """Load any supported file, chunk, embed, and build the query engine."""
+    docs = load_file(file_path)
+    index = build_index(docs)
+    engine = build_rag_pipeline(index)
+    return index, engine
 
 
 # =============================================================================
@@ -902,15 +925,17 @@ def ingest_pdf(
 # =============================================================================
 
 def main():
-    pdf_path = input("PDF path: ").strip().strip('"')
-    if not os.path.isfile(pdf_path):
-        print(f"File not found: {pdf_path}")
+    file_path = input(
+        "File path (PDF, Word, Excel, slides, HTML, txt, images, …): "
+    ).strip().strip('"')
+    if not os.path.isfile(file_path):
+        print(f"File not found: {file_path}")
         return
 
-    print(f"\nLoading {os.path.basename(pdf_path)}…")
-    index, engine, job_id = ingest_pdf(pdf_path)
-    print(f"Job {job_id} ready — blobs/metadata under ./data/rag/")
-    print(f"Ingested logical segments from {len(page_manifest)} page(s).")
+    print(f"\nLoading {os.path.basename(file_path)}…")
+    _, engine = ingest_file(file_path)
+    seg = "page(s)" if Path(file_path).suffix.lower() == PDF_EXTENSION else "segment(s)"
+    print(f"Ingested {len(page_manifest)} {seg}.")
     print('Ready — type your question or "exit" to quit.\n')
 
     while True:
