@@ -1,4 +1,4 @@
-# AI Mortgage Document Intelligence Automation System
+# Document RAG Pipeline
 
 A RAG (Retrieval-Augmented Generation) pipeline for querying PDF documents using natural language.
 
@@ -10,10 +10,10 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
 
 | Component | Tool |
 |---|---|
-| **LLM** | Google Gemini (via `llama-index-llms-google-genai`)|
+| **LLM** | Google Gemini (via `google.genai`) |
 | **Embeddings** | HuggingFace `sentence-transformers/all-MiniLM-L6-v2` |
 | **RAG Framework** | LlamaIndex |
-| **PDF Extraction** | PyMuPDF (`fitz`) |
+| **PDF Extraction** | PyMuPDF (`fitz`), `pymupdf4llm`, `unstructured`, Tesseract OCR |
 | **Vector Search** | LlamaIndex `VectorStoreIndex` |
 | **Keyword Search** | BM25 Retriever |
 | **Reranking** | `cross-encoder/ms-marco-MiniLM-L-6-v2` (SentenceTransformer) |
@@ -21,11 +21,12 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
 
 ## How It Works
 
-1. **PDF ingestion** — PyMuPDF extracts text page by page
-2. **Indexing** — pages are embedded and stored in a vector index
-3. **Hybrid retrieval** — queries hit both semantic (vector) and keyword (BM25) search, results are merged and deduplicated
-4. **Reranking** — a cross-encoder reranker scores and re-orders the top chunks
-5. **Generation** — Gemini synthesizes a single concise answer from the retrieved context
+1. **PDF ingestion** — two-pass extract: fitz classifies each page (`native_text` / `image_dominant` / `table_heavy`), then routes to batched `pymupdf4llm`, parallel `unstructured`, or OCR
+2. **Segmentation** — heuristic boundaries group pages into logical segments (no domain-specific doc labels)
+3. **Indexing** — segments are chunked, embedded, and stored in a vector index
+4. **Hybrid retrieval** — queries hit both semantic (vector) and keyword (BM25) search, results are merged and deduplicated
+5. **Reranking** — a cross-encoder reranker scores and re-orders the top chunks
+6. **Generation** — Gemini synthesizes a single concise answer from the retrieved context
 
 ## Setup
 
@@ -37,7 +38,8 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
 2. Create a `.env` file:
    ```
    GEMINI_API_KEY=your_key_here
-   QUERY_DOC_TYPE_ROUTING=false
+   TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+   MAX_EXTRACT_WORKERS=4
    ```
 
 3. Install Tesseract OCR (required for scanned/image-heavy pages):
@@ -58,7 +60,8 @@ Upload a PDF and ask plain-English questions. The system extracts text, indexes 
 
 | Date | Status | Details |
 |---|---|---|
-| 2026-05-28 | Current Pipeline | PDF extraction (PyMuPDF + Tesseract OCR fallback); heuristic segmentation + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex) |
+| 2026-05-28 | Pipeline v1 | PDF extraction (PyMuPDF + Tesseract OCR fallback); classification + boundary detection + logical document grouping; chunking (`SentenceSplitter`); hybrid retrieval (Vector + BM25); reranking (cross-encoder `ms-marco-MiniLM-L-6-v2`); generation (Gemini via LlamaIndex); optional query routing |
+| 2026-05-28 | Ingest refactor (current) | Two-pass ingest: fitz page classification (`native_text` / `image_dominant` / `table_heavy`) → batched `pymupdf4llm`, parallel `unstructured` (scanned tables), main-thread OCR (image pages); heuristic segmentation (domain-agnostic, no `doc_type`); compact `page_manifest`; full-index retrieval + Gemini (`google.genai`) |
 | Planned | Step 1 | Multi-format support beyond PDF (Word, Excel, slides, web pages) |
 | Planned | Step 2 | Document layout analysis before chunking (separate headers, tables, figures) |
 | Planned | Step 3 | Table recognition/extraction as structured data |
